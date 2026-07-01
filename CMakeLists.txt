@@ -69,9 +69,18 @@ else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FREERDP REQUIRED freerdp3)
     pkg_check_modules(WINPR   REQUIRED winpr3)
+    # The server-side channel implementations (rdpgfx/cliprdr/rdpsnd server
+    # contexts) live in libfreerdp-server3, which freerdp3.pc does NOT pull in.
+    # Without it the link fails with undefined _rdpgfx_server_context_new etc.
+    pkg_check_modules(FREERDP_SERVER REQUIRED freerdp-server3)
     set(FREERDP_INCLUDE "${FREERDP_INCLUDE_DIRS}")
     set(WINPR_INCLUDE   "${WINPR_INCLUDE_DIRS}")
-    set(FREERDP_LINK_LIBS ${FREERDP_LIBRARIES} ${WINPR_LIBRARIES})
+    set(FREERDP_LINK_LIBS ${FREERDP_SERVER_LIBRARIES} ${FREERDP_LIBRARIES} ${WINPR_LIBRARIES})
+    # pkg_check_modules puts the bare library names in *_LIBRARIES but the -L
+    # search path in *_LIBRARY_DIRS. Homebrew installs FreeRDP under a keg that
+    # is NOT on Apple clang's default linker search path, so without applying the
+    # library dirs the link fails with "library 'freerdp3' not found". Apply them.
+    set(FREERDP_LINK_DIRS ${FREERDP_SERVER_LIBRARY_DIRS} ${FREERDP_LIBRARY_DIRS} ${WINPR_LIBRARY_DIRS})
 endif()
 
 # ── Target ────────────────────────────────────────────────────────────────
@@ -105,6 +114,9 @@ target_include_directories(macos-rdp-daemon PRIVATE
     # Static build: FreeRDP installs headers under include/freerdp3 and include/winpr3
     $<$<BOOL:${MACOS_RDP_STATIC}>:${FREERDP_STATIC_INSTALL}/include>
 )
+
+# Apply the pkg-config -L search paths (dynamic build only; empty for static).
+target_link_directories(macos-rdp-daemon PRIVATE ${FREERDP_LINK_DIRS})
 
 target_link_libraries(macos-rdp-daemon PRIVATE
     ${FREERDP_LINK_LIBS}

@@ -181,7 +181,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch AgentController.readEnvironment() {
         case let .success(env):
             showCursorItem.state    = (env[AgentController.EnvKey.showCursor]   == "1") ? .on : .off
-            cursorShapesItem.state  = (env[AgentController.EnvKey.cursorShapes] == "1") ? .on : .off
+            // RDP_CURSOR_SHAPES: "1"/absent = stream real shapes (default), "0" = system arrow
+            cursorShapesItem.state  = (env[AgentController.EnvKey.cursorShapes] != "0") ? .on : .off
             sharedModeItem.state    = (env[AgentController.EnvKey.sharedMode]   == "1") ? .on : .off
             privacyBlankItem.state  = (env[AgentController.EnvKey.privacyBlank] == "1") ? .on : .off
             rdpdrEnabledItem.state  = (env[AgentController.EnvKey.rdpdrEnabled] == "1") ? .on : .off

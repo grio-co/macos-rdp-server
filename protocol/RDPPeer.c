@@ -217,6 +217,12 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
         }
     }
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
+    if (c->disp)   {
+        if (c->dispOpened) (void)c->disp->Close(c->disp);
+        disp_server_context_free(c->disp);
+        c->disp = NULL;
+        c->dispOpened = false;
+    }
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     /* Audio input (MS-RDPEAI) — close and release the ObjC object. */
@@ -239,6 +245,13 @@ static BOOL peer_keyboard(rdpInput *input, UINT16 flags, UINT8 code) {
     RDPPeerContext *ctx = (RDPPeerContext *)input->context;
     if (ctx->callbacks.onKeyboard)
         ctx->callbacks.onKeyboard(ctx->callbacks.userdata, flags, code);
+    return TRUE;
+}
+
+static BOOL peer_unicode_keyboard(rdpInput *input, UINT16 flags, UINT16 code) {
+    RDPPeerContext *ctx = (RDPPeerContext *)input->context;
+    if (ctx->callbacks.onUnicodeKeyboard)
+        ctx->callbacks.onUnicodeKeyboard(ctx->callbacks.userdata, flags, code);
     return TRUE;
 }
 
@@ -335,7 +348,65 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
     return CHANNEL_RC_OK;
 }
 
+/* ── MS-RDPEDISP (DISPLAY_CONTROL) ─────────────────────────────────────── */
+
+/* The client asked us to change resolution / monitor layout (MS-RDPEDISP
+ * 2.2.2.2), e.g. because its window was resized or it went full-screen.
+ *
+ * OBSERVE-ONLY, deliberately. Honouring a resize means recreating the virtual
+ * display, capture and encoder at the new size, then telling the client via
+ * RDPGFX_RESET_GRAPHICS + a new surface. RESET_GRAPHICS is the problem: field
+ * testing found mstsc drops the connection ~10ms after receiving ours (see the
+ * note in gfx_caps_advertise), so wiring the resize on top of it today would
+ * trade "resize does nothing" for "resize kills the session" — strictly worse.
+ *
+ * Logging the request is still worth landing: it proves whether the client
+ * negotiates the channel and what geometry it asks for, which is the missing
+ * evidence needed to attack the RESET_GRAPHICS bug. */
+static UINT disp_monitor_layout(DispServerContext *context,
+                                const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu) {
+    RDPPeerContext *ctx = (RDPPeerContext *)context->custom;
+    if (!pdu) return CHANNEL_RC_OK;
+
+    for (UINT32 i = 0; i < pdu->NumMonitors; i++) {
+        const DISPLAY_CONTROL_MONITOR_LAYOUT *m = &pdu->Monitors[i];
+        rdp_info("disp: client requested monitor %u/%u %ux%u at (%d,%d) "
+                 "scale=%u%% orientation=%u%s — NOT applied (dynamic resize "
+                 "needs RESET_GRAPHICS; see disp_monitor_layout)",
+                 i + 1, pdu->NumMonitors, m->Width, m->Height, m->Left, m->Top,
+                 m->DesktopScaleFactor, m->Orientation,
+                 (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) ? " primary" : "");
+    }
+    (void)ctx;
+    return CHANNEL_RC_OK;
+}
+
 /* ── Clipboard callbacks ───────────────────────────────────────────────── */
+
+/* Advertise one available format; the client requests the bytes on paste.
+ * Caller MUST hold xportLock and MUST have verified ctx->cliprdr && clipReady.
+ *
+ * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the
+ * FreeRDP warning "cliprdr_packet_format_list_new: called with invalid type
+ * 00000000". And a Format List is NOT a response — msgFlags must be 0, never
+ * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs).
+ *
+ * formatName MUST be a non-NULL (empty) string, NOT NULL. With
+ * useLongFormatNames=TRUE the FreeRDP serializer miscomputes the PDU length for
+ * a NULL name and under-allocates the send stream, then aborts on a
+ * Stream_Write_UINT32 (WinPR assert Stream_GetRemainingCapacity>=4) — a hard
+ * crash that took down the whole daemon mid-clipboard-exchange. An empty ""
+ * yields a 2-byte UTF-16 null terminator and a consistent length. Standard
+ * formats (CF_UNICODETEXT etc.) are still keyed by id alone. */
+static void clip_send_format_list_locked(RDPPeerContext *ctx, uint32_t format) {
+    CLIPRDR_FORMAT fmt = { .formatId = (UINT32)format, .formatName = (char *)"" };
+    CLIPRDR_FORMAT_LIST list = {0};
+    list.common.msgType  = CB_FORMAT_LIST;
+    list.common.msgFlags = 0;
+    list.numFormats      = 1;
+    list.formats         = &fmt;
+    ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
+}
 
 /* The client sent us ITS Clipboard Capabilities (MS-RDPECLIP step 3). This is
  * the first proof mstsc accepted our caps + monitor-ready and is engaging the
@@ -651,6 +722,28 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         ctx->gfx->Initialize(ctx->gfx, TRUE);
     rdp_verbose("GFX context created (external-thread mode); open deferred");
 
+    /* MS-RDPEDISP DISPLAY_CONTROL. Like GFX this is a DVC, so Open() is deferred
+     * to the run loop until drdynvc is READY. Observe-only for now — see
+     * disp_monitor_layout. */
+    ctx->disp = disp_server_context_new(ctx->vcm);
+    if (!ctx->disp) {
+        /* Non-fatal: without it the client just can't request resolutions, which
+         * is the status quo. Everything else still works. */
+        rdp_error("disp_server_context_new failed — dynamic resolution unavailable");
+    } else {
+        ctx->disp->custom            = ctx;
+        ctx->disp->rdpcontext        = peer->context;
+        ctx->disp->DispMonitorLayout = disp_monitor_layout;
+        /* One monitor: multimon is advertised in settings but not implemented
+         * (no monitor layout is ever sent), so claiming more here would be
+         * another capability we can't honour. The area factors are the
+         * MS-RDPEDISP 2.2.2.1 defaults. */
+        ctx->disp->MaxNumMonitors        = 1;
+        ctx->disp->MaxMonitorAreaFactorA = 8192;
+        ctx->disp->MaxMonitorAreaFactorB = 8192;
+        rdp_verbose("DISP context created; open deferred");
+    }
+
     /* Clipboard. */
     ctx->cliprdr = cliprdr_server_context_new(ctx->vcm);
     if (ctx->cliprdr) {
@@ -875,9 +968,10 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     peer->context->update->SuppressOutput = peer_suppress_output;
 
     /* Input is on rdpContext, not on freerdp_peer in 3.x. */
-    peer->context->input->KeyboardEvent      = peer_keyboard;
-    peer->context->input->MouseEvent         = peer_mouse;
-    peer->context->input->ExtendedMouseEvent = peer_mouse_ex;
+    peer->context->input->KeyboardEvent        = peer_keyboard;
+    peer->context->input->UnicodeKeyboardEvent = peer_unicode_keyboard;
+    peer->context->input->MouseEvent           = peer_mouse;
+    peer->context->input->ExtendedMouseEvent   = peer_mouse_ex;
 
     if (!peer->Initialize(peer)) {
         rdp_error("peer Initialize failed (TLS handshake error)");
@@ -989,6 +1083,21 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
+    /* Same deferral for DISP: drdynvc must be READY before a DVC can open.
+     * Failure is non-fatal — the client simply can't request resolutions. */
+    if (ok && ctx->disp && !ctx->dispOpened &&
+        WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_READY) {
+        if (ctx->disp->Open(ctx->disp) == CHANNEL_RC_OK) {
+            ctx->dispOpened = true;
+            rdp_info("DISP channel opened (drdynvc ready) — resolution requests "
+                     "will be logged, not applied");
+        } else {
+            rdp_error("DISP Open failed — dynamic resolution unavailable");
+            /* Don't retry every 50ms for the life of the session. */
+            ctx->dispOpened = true;
+        }
+    }
+
     /* Drain GFX channel messages once the channel is open. */
     if (ok && ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
@@ -1010,6 +1119,20 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
             if (crc != CHANNEL_RC_OK)
                 rdp_verbose("clipboard read failed: %u", crc);
         }
+    }
+
+    /* The drain above may have just dispatched the client's Capabilities/Format
+     * List and flipped clipReady. If the host copied something before that
+     * landed, its advertise was skipped — send it now. This runs on the same
+     * thread and under the same lock as every other transport write, which is
+     * why it is here and not in the cliprdr callback: advertising from inside
+     * FreeRDP's own receive dispatch re-enters the cliprdr state machine. */
+    if (ok && ctx->cliprdr && ctx->clipReady && ctx->clipPendingAdvertise &&
+        ctx->clipData) {
+        clip_send_format_list_locked(ctx, ctx->clipFormat);
+        ctx->clipPendingAdvertise = false;
+        rdp_verbose("clipboard: flushed deferred advertise of format 0x%08x "
+                    "(%zu bytes) on handshake", ctx->clipFormat, ctx->clipLen);
     }
 
     /* Drain rdpdr static VC messages (RDP_RDPDR_ENABLED=1 only). */
@@ -1321,37 +1444,19 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
     /* Hold the data but DO NOT advertise until the cliprdr handshake is complete.
      * Calling ServerFormatList before the client has engaged the channel corrupts
      * FreeRDP's cliprdr send stream and aborts the daemon (the crash-loop that gave
-     * the client 0x904). Once ready, the next pasteboard change re-advertises. */
+     * the client 0x904). Flag it instead; the run loop advertises on clipReady. */
     if (!ctx->clipReady) {
+        pthread_mutex_lock(&ctx->xportLock);
+        ctx->clipPendingAdvertise = true;
+        pthread_mutex_unlock(&ctx->xportLock);
         rdp_verbose("clipboard: held %zu bytes (fmt 0x%08x) — channel not ready, "
-                    "advertise deferred", len, format);
+                    "advertise deferred to handshake", len, format);
         return true;
     }
 
-
-    /* Advertise the available format; the client requests the bytes on paste.
-     *
-     * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the
-     * FreeRDP warning "cliprdr_packet_format_list_new: called with invalid type
-     * 00000000". And a Format List is NOT a response — msgFlags must be 0, never
-     * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs).
-     *
-     * formatName MUST be a non-NULL (empty) string, NOT NULL. With
-     * useLongFormatNames=TRUE the FreeRDP serializer miscomputes the PDU length for
-     * a NULL name and under-allocates the send stream, then aborts on a
-     * Stream_Write_UINT32 (WinPR assert Stream_GetRemainingCapacity>=4) — a hard
-     * crash that took down the whole daemon mid-clipboard-exchange. An empty ""
-     * yields a 2-byte UTF-16 null terminator and a consistent length. Standard
-     * formats (CF_UNICODETEXT etc.) are still keyed by id alone. */
-    CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = (char *)"" };
-    CLIPRDR_FORMAT_LIST list = {0};
-    list.common.msgType  = CB_FORMAT_LIST;
-    list.common.msgFlags = 0;
-    list.numFormats      = 1;
-    list.formats         = &fmt;
     /* Called from the clipboard poll thread; serialize against the transport. */
     pthread_mutex_lock(&ctx->xportLock);
-    ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
+    clip_send_format_list_locked(ctx, format);
     pthread_mutex_unlock(&ctx->xportLock);
     rdp_verbose("clipboard: advertised format 0x%08x (%zu bytes held)", format, len);
     return true;

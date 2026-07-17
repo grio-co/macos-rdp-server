@@ -33,6 +33,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 | 2.5 | Frame rate / smoothness | Drag a window, scroll | Fluid ~30 fps | ❓ |
 | 2.6 | Dynamic resolution change | Resize mstsc window | Session adapts | ❓ |
 | 2.7 | Non-ultrawide client (1920×1080) | Connect from 16:9 | Correct proportions | ❓ |
+| 2.7a | Dynamic resolution (MS-RDPEDISP) | Resize the client window; watch the log | `disp: client requested monitor …` appears | ⚠️ observe-only — channel receives, resize NOT applied (blocked on RESET_GRAPHICS) |
 | 2.8 | Privacy blank on connect | Set RDP_PRIVACY_BLANK=1 | Local display dims/blanks | ⚠️ (DisplayServices brightness only) |
 | 2.9 | Shared mode | Set RDP_SHARED_MODE=1 | Remote + local see same screen | ❓ |
 | 2.10 | Wake Mac on connect | Mac display asleep, then connect | Display wakes, capture starts | ✅ (IOPMAssertion) |
@@ -41,7 +42,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 | # | Item | How to test | Expected | Status |
 |---|------|-------------|----------|--------|
 | 3.1 | Mouse move (1:1 position) | Move across whole screen | Tracks accurately | ✅ |
-| 3.2 | Cursor shapes (I-beam, resize, spinner) | Hover text / window edge | Shows correct cursor | ✅ (RDP_CURSOR_SHAPES=1, 24bpp) |
+| 3.2 | Cursor shapes (I-beam, resize, spinner) | Hover text / window edge | Shows correct cursor | ✅ (24bpp; default on, `RDP_CURSOR_SHAPES=0` opts out) |
 | 3.3 | Left/right/middle click | Click around | Registers correctly | ❓ |
 | 3.4 | Click-drag | Drag a window / select text | Works | ❓ |
 | 3.5 | Scroll wheel (vert/horiz) | Scroll a page | Scrolls correct direction | ❓ |

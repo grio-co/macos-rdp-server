@@ -7,6 +7,7 @@
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
 #include <freerdp/server/rdpgfx.h>
+#include <freerdp/server/disp.h>
 #include <freerdp/server/cliprdr.h>
 #include <freerdp/server/rdpsnd.h>
 #include <freerdp/channels/wtsvc.h>
@@ -32,6 +33,9 @@ typedef void (*RDPIrpCallback)(uint32_t ioStatus,
 
 typedef struct {
     RDPPeerInputCallback     onKeyboard;
+    /* MS-RDPBCGR 2.2.8.1.1.3.1.1.2 — code is a UTF-16 code unit, not a scancode.
+     * Sent by clients for characters the scancode layout can't express. */
+    RDPPeerInputCallback     onUnicodeKeyboard;
     RDPPeerMouseCallback     onMouse;
     RDPPeerMouseCallback     onMouseEx;
     RDPPeerClipboardCallback onClipboard;
@@ -51,6 +55,12 @@ struct rdp_peer_context {
     RDPPeerCallbacks    callbacks;
     HANDLE              vcm;        /* WTSOpenServerA handle — owns gfx/cliprdr/rdpsnd */
     RdpgfxServerContext *gfx;
+    /* MS-RDPEDISP DISPLAY_CONTROL DVC. Currently OBSERVE-ONLY: it records what
+     * resolution the client asks for but does not act on it, because applying a
+     * resize needs RDPGFX_RESET_GRAPHICS, which mstsc currently reacts to by
+     * resetting the connection (see gfx_caps_advertise). Landing the receive path
+     * first makes that blocker diagnosable without risking the session. */
+    DispServerContext   *disp;
     CliprdrServerContext *cliprdr;
     RdpsndServerContext  *rdpsnd;
     uint32_t             surfaceId;
@@ -66,6 +76,7 @@ struct rdp_peer_context {
      * the loop already holds it. */
     pthread_mutex_t      xportLock;
     bool                 gfxOpened;  /* GFX DVC Open() succeeded (drdynvc ready) */
+    bool                 dispOpened; /* DISP DVC Open() succeeded (drdynvc ready) */
     bool                 gfxReady;   /* client sent GFX caps; surface mapped */
     bool                 sentKeyframe;     /* a keyframe has been sent this session */
     bool                 keyframeRequested;/* debounce: requested an IDR, awaiting it */
@@ -110,6 +121,11 @@ struct rdp_peer_context {
      * (WinPR Stream_Write_UINT32 assert). Set true in the client caps/format-list
      * callbacks; gates rdp_peer_send_clipboard. */
     bool                 clipReady;
+    /* Host clipboard data arrived while clipReady was false, so its advertise was
+     * skipped. The run loop re-advertises once the handshake lands; without this
+     * the held data stays invisible to the client until the NEXT pasteboard
+     * change, which for a copy made during connect may never come. */
+    bool                 clipPendingAdvertise;
     /* AUDIO_INPUT (MS-RDPEAI) mic-redirection channel. Non-NULL only when
      * RDP_AUDIO_INPUT=1. Stored as void* so this C header stays ObjC-free;
      * RDPPeer.c casts it through __bridge when handing it to AudioInput.m.

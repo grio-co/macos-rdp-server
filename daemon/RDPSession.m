@@ -69,6 +69,7 @@ static const uint32_t kDefaultBitrate = 8000;
     rdp_verbose("creating RDP peer for fd=%d", _fd);
     RDPPeerCallbacks cb = {
         .onKeyboard  = rdp_on_keyboard,
+        .onUnicodeKeyboard = rdp_on_unicode_keyboard,
         .onMouse     = rdp_on_mouse,
         .onMouseEx   = rdp_on_mouse_ex,
         .onClipboard = rdp_on_clipboard,
@@ -144,6 +145,12 @@ static void rdp_on_keyboard(void *ud, uint16_t flags, uint16_t code) {
     RDPSession *self = (__bridge RDPSession *)ud;
     rdp_debug("key flags=0x%04x code=0x%02x", flags, code);
     [self.injector injectKeyEvent:flags scanCode:code];
+}
+
+static void rdp_on_unicode_keyboard(void *ud, uint16_t flags, uint16_t code) {
+    RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_debug("unicode key flags=0x%04x code=U+%04X", flags, code);
+    [self.injector injectUnicodeKeyEvent:flags code:code];
 }
 
 static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
@@ -312,24 +319,26 @@ static void rdp_on_keyframe_request(void *ud) {
     rdp_peer_send_default_cursor(_peer);
 
     /* Stream the REAL Mac cursor shapes (I-beam, resize, hand, …) as RDP
-     * color-pointer PDUs. OPT-IN via RDP_CURSOR_SHAPES=1 (default OFF): the
-     * current 32bpp color-pointer renders INVISIBLE on mstsc (shapes are captured
-     * and sent at correct sizes, but the client draws nothing — a 32bpp-alpha
-     * color-pointer quirk under investigation). Default keeps the client-side
-     * SYSPTR_DEFAULT arrow above, which is always visible. Re-enable once the
-     * pointer encoding is fixed (likely switch to 24bpp XOR + 1bpp AND mask). */
+     * color-pointer PDUs. Default ON; opt OUT with RDP_CURSOR_SHAPES=0, which
+     * falls back to the client-side SYSPTR_DEFAULT arrow advertised above.
+     *
+     * This was default-off while the pointer was encoded 32bpp/alpha, which
+     * mstsc renders invisible. rdp_peer_send_cursor_shape now emits a 24bpp BGR
+     * XOR + 1bpp AND mask, which mstsc renders reliably, so the gate no longer
+     * has anything to protect against. */
     const char *curShapes = getenv("RDP_CURSOR_SHAPES");
-    if (curShapes && strcmp(curShapes, "1") == 0) {
+    if (!curShapes || strcmp(curShapes, "0") != 0) {
         _cursor = [[CursorCapture alloc] init];
         _cursor.handler = ^(const uint8_t *bgra, uint32_t cw, uint32_t ch,
                             uint16_t hotX, uint16_t hotY) {
             rdp_peer_send_cursor_shape(weak.peer, bgra, cw, ch, hotX, hotY);
         };
         [_cursor start];
-        rdp_info("cursor-shape streaming ON (RDP_CURSOR_SHAPES=1)");
+        rdp_info("cursor-shape streaming ON (default) — real Mac cursor shapes, "
+                 "24bpp; set RDP_CURSOR_SHAPES=0 to fall back to the system arrow");
     } else {
-        rdp_info("cursor-shape streaming OFF (default) — client draws the system "
-                 "arrow; set RDP_CURSOR_SHAPES=1 to stream real Mac cursor shapes");
+        rdp_info("cursor-shape streaming OFF (RDP_CURSOR_SHAPES=0) — client draws "
+                 "the system arrow");
     }
 }
 

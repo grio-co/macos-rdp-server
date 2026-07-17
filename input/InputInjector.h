@@ -31,6 +31,9 @@ NS_ASSUME_NONNULL_BEGIN
                      sourceHeight:(uint32_t)sourceHeight;
 
 - (void)injectKeyEvent:(uint16_t)flags scanCode:(uint16_t)code;
+/* code is a UTF-16 code unit. Surrogate pairs are buffered across two calls and
+ * posted once the low surrogate arrives. */
+- (void)injectUnicodeKeyEvent:(uint16_t)flags code:(uint16_t)code;
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
 /* Wheel rotation is encoded entirely within flags; decoded internally. */
 - (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;

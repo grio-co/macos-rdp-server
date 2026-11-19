@@ -223,7 +223,8 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
         c->disp = NULL;
         c->dispOpened = false;
     }
-    if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
+    /* Fails any paste still waiting on the client, waits for in-flight users, frees the channel. */
+    if (c->clip)   { rdp_clip_destroy(c->clip);              c->clip   = NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     /* Audio input (MS-RDPEAI) — close and release the ObjC object. */
     if (c->audioInput) { rdp_audio_input_close(c->audioInput); c->audioInput = NULL; }
@@ -234,7 +235,6 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
         c->rdpdrEvent   = NULL;
     }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
-    if (c->clipData) { free(c->clipData); c->clipData = NULL; c->clipLen = 0; }
     pthread_mutex_destroy(&c->xportLock);
     rdp_debug("peer context freed");
 }
@@ -378,171 +378,6 @@ static UINT disp_monitor_layout(DispServerContext *context,
                  (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) ? " primary" : "");
     }
     (void)ctx;
-    return CHANNEL_RC_OK;
-}
-
-/* ── Clipboard callbacks ───────────────────────────────────────────────── */
-
-/* Advertise one available format; the client requests the bytes on paste.
- * Caller MUST hold xportLock and MUST have verified ctx->cliprdr && clipReady.
- *
- * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the
- * FreeRDP warning "cliprdr_packet_format_list_new: called with invalid type
- * 00000000". And a Format List is NOT a response — msgFlags must be 0, never
- * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs).
- *
- * formatName MUST be a non-NULL (empty) string, NOT NULL. With
- * useLongFormatNames=TRUE the FreeRDP serializer miscomputes the PDU length for
- * a NULL name and under-allocates the send stream, then aborts on a
- * Stream_Write_UINT32 (WinPR assert Stream_GetRemainingCapacity>=4) — a hard
- * crash that took down the whole daemon mid-clipboard-exchange. An empty ""
- * yields a 2-byte UTF-16 null terminator and a consistent length. Standard
- * formats (CF_UNICODETEXT etc.) are still keyed by id alone. */
-static void clip_send_format_list_locked(RDPPeerContext *ctx, uint32_t format) {
-    CLIPRDR_FORMAT fmt = { .formatId = (UINT32)format, .formatName = (char *)"" };
-    CLIPRDR_FORMAT_LIST list = {0};
-    list.common.msgType  = CB_FORMAT_LIST;
-    list.common.msgFlags = 0;
-    list.numFormats      = 1;
-    list.formats         = &fmt;
-    ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
-}
-
-/* The client sent us ITS Clipboard Capabilities (MS-RDPECLIP step 3). This is
- * the first proof mstsc accepted our caps + monitor-ready and is engaging the
- * channel. We just log it; the channel layer has already latched the negotiated
- * flags (e.g. useLongFormatNames) onto the context. */
-static UINT cliprdr_client_capabilities(CliprdrServerContext *cliprdr,
-                                        const CLIPRDR_CAPABILITIES *caps) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    /* Client engaged the channel — it is now safe to advertise (ServerFormatList). */
-    if (ctx) ctx->clipReady = true;
-    UINT32 flags = 0, version = 0;
-    for (UINT32 i = 0; i < caps->cCapabilitiesSets; i++) {
-        const CLIPRDR_CAPABILITY_SET *set = &caps->capabilitySets[i];
-        if (set->capabilitySetType == CB_CAPSTYPE_GENERAL) {
-            const CLIPRDR_GENERAL_CAPABILITY_SET *g =
-                (const CLIPRDR_GENERAL_CAPABILITY_SET *)set;
-            version = g->version;
-            flags   = g->generalFlags;
-        }
-    }
-    rdp_verbose("clipboard: <- ClientCapabilities (%u sets, version=0x%08x "
-                "generalFlags=0x%08x longNames=%d)",
-                caps->cCapabilitiesSets, version, flags,
-                (flags & CB_USE_LONG_FORMAT_NAMES) ? 1 : 0);
-    return CHANNEL_RC_OK;
-}
-
-/* The client ACKed our Format List (our Mac->Win advertise). On success it will
- * follow up with a Format Data Request when the user pastes on Windows. */
-static UINT cliprdr_client_format_list_response(
-        CliprdrServerContext *cliprdr,
-        const CLIPRDR_FORMAT_LIST_RESPONSE *resp) {
-    (void)cliprdr;
-    rdp_verbose("clipboard: <- ClientFormatListResponse (flags=0x%04x %s)",
-                resp->common.msgFlags,
-                (resp->common.msgFlags & CB_RESPONSE_OK) ? "OK" : "FAIL");
-    return CHANNEL_RC_OK;
-}
-
-/* Windows copied something: the client advertises the formats it now holds. We
- * must (a) ACK the list, then (b) PULL the bytes we care about by sending a Format
- * Data Request — the client never pushes data unsolicited. We only consume text,
- * so pick CF_UNICODETEXT (preferred, lossless UTF-16) and fall back to CF_TEXT. */
-static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
-                                        const CLIPRDR_FORMAT_LIST *list) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    ctx->clipReady = true;   /* channel fully engaged — Mac->Win advertise is safe */
-    rdp_verbose("clipboard: <- ClientFormatList (%u formats)", list->numFormats);
-    for (UINT32 i = 0; i < list->numFormats; i++)
-        rdp_verbose("clipboard:    format[%u] id=0x%08x name=%s", i,
-                    list->formats[i].formatId,
-                    list->formats[i].formatName ? list->formats[i].formatName : "(none)");
-
-    /* Acknowledge the advertisement first (msgType is set by the server serializer,
-     * but a Format List RESPONSE carries CB_RESPONSE_OK in msgFlags). */
-    CLIPRDR_FORMAT_LIST_RESPONSE resp = {0};
-    resp.common.msgType  = CB_FORMAT_LIST_RESPONSE;
-    resp.common.msgFlags = CB_RESPONSE_OK;
-    cliprdr->ServerFormatListResponse(cliprdr, &resp);
-
-    /* Choose the best text format the client offers. */
-    UINT32 want = 0;
-    for (UINT32 i = 0; i < list->numFormats; i++) {
-        UINT32 id = list->formats[i].formatId;
-        if (id == CF_UNICODETEXT) { want = CF_UNICODETEXT; break; }
-        if (id == CF_TEXT)        { want = CF_TEXT; }
-    }
-    if (!want) {
-        rdp_verbose("clipboard: client offered no text format — ignoring");
-        return CHANNEL_RC_OK;
-    }
-
-    /* Request the bytes. The response (cliprdr_client_format_data) has no format
-     * id of its own, so stash what we asked for. */
-    ctx->clipReqFormat = want;
-    CLIPRDR_FORMAT_DATA_REQUEST dreq = {0};
-    dreq.common.msgType   = CB_FORMAT_DATA_REQUEST;
-    /* dataLen MUST be 4: FreeRDP's cliprdr_server_format_data_request allocates a
-     * stream of (common.dataLen + 8) and then writes the 4-byte requestedFormatId
-     * AFTER the 8-byte header. With dataLen=0 the stream is exactly the header and
-     * the formatId write runs off the end -> WinPR Stream_Write_UINT32 abort (the
-     * crash that locked the client out on every connect). */
-    dreq.common.dataLen   = 4;
-    dreq.requestedFormatId = want;
-    rdp_verbose("clipboard: requesting format 0x%08x from client", want);
-    cliprdr->ServerFormatDataRequest(cliprdr, &dreq);
-    return CHANNEL_RC_OK;
-}
-
-/* The client answered our Format Data Request: hand the bytes to the Mac
- * pasteboard via the onClipboard callback. The response carries no format id, so
- * we use the one we requested (clipReqFormat). */
-static UINT cliprdr_client_format_data(CliprdrServerContext *cliprdr,
-                                        const CLIPRDR_FORMAT_DATA_RESPONSE *resp) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    rdp_verbose("clipboard: <- ClientFormatDataResponse (flags=0x%04x len=%u)",
-                resp->common.msgFlags, resp->common.dataLen);
-    if ((resp->common.msgFlags & CB_RESPONSE_OK) && ctx->callbacks.onClipboard) {
-        rdp_verbose("clipboard: %u bytes from client (format 0x%08x)",
-                    resp->common.dataLen, ctx->clipReqFormat);
-        ctx->callbacks.onClipboard(ctx->callbacks.userdata,
-                                   resp->requestedFormatData,
-                                   resp->common.dataLen,
-                                   ctx->clipReqFormat ? ctx->clipReqFormat
-                                                      : (UINT32)CF_UNICODETEXT);
-    } else {
-        rdp_verbose("clipboard: client format-data response failed (flags=0x%04x)",
-                    resp->common.msgFlags);
-    }
-    return CHANNEL_RC_OK;
-}
-
-/* Client pasted: it requests the bytes for a format we advertised. Reply with
- * the held host data (or an empty failure response if we have none). */
-static UINT cliprdr_client_format_data_request(
-        CliprdrServerContext *cliprdr,
-        const CLIPRDR_FORMAT_DATA_REQUEST *req) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
-    rdp_verbose("clipboard: <- ClientFormatDataRequest (format 0x%08x)",
-                req->requestedFormatId);
-
-    if (ctx->clipData && ctx->clipLen > 0 &&
-        req->requestedFormatId == ctx->clipFormat) {
-        resp.common.msgFlags     = CB_RESPONSE_OK;
-        resp.common.dataLen      = (UINT32)ctx->clipLen;
-        resp.requestedFormatData = (BYTE *)ctx->clipData;
-        rdp_verbose("clipboard: serving %zu bytes for format 0x%08x",
-                    ctx->clipLen, req->requestedFormatId);
-    } else {
-        resp.common.msgFlags = CB_RESPONSE_FAIL;
-        rdp_verbose("clipboard: data request 0x%08x but nothing matching held "
-                    "(have format 0x%08x, %zu bytes)",
-                    req->requestedFormatId, ctx->clipFormat, ctx->clipLen);
-    }
-    cliprdr->ServerFormatDataResponse(cliprdr, &resp);
     return CHANNEL_RC_OK;
 }
 
@@ -744,46 +579,8 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         rdp_verbose("DISP context created; open deferred");
     }
 
-    /* Clipboard. */
-    ctx->cliprdr = cliprdr_server_context_new(ctx->vcm);
-    if (ctx->cliprdr) {
-        ctx->cliprdr->custom                   = ctx;
-        ctx->cliprdr->rdpcontext               = peer->context;
-        /* Register EVERY inbound callback BEFORE Open() so no client PDU is
-         * dropped, and so the log shows the full MS-RDPECLIP exchange. */
-        ctx->cliprdr->ClientCapabilities       = cliprdr_client_capabilities;
-        ctx->cliprdr->ClientFormatList         = cliprdr_client_format_list;
-        ctx->cliprdr->ClientFormatListResponse = cliprdr_client_format_list_response;
-        ctx->cliprdr->ClientFormatDataResponse = cliprdr_client_format_data;
-        ctx->cliprdr->ClientFormatDataRequest  = cliprdr_client_format_data_request;
-        ctx->cliprdr->useLongFormatNames       = TRUE;
-        if (ctx->cliprdr->Open(ctx->cliprdr) != CHANNEL_RC_OK) {
-            rdp_verbose("clipboard channel open failed");
-            cliprdr_server_context_free(ctx->cliprdr);
-            ctx->cliprdr = NULL;
-        } else {
-            /* We pump the channel via the shared VCM, NOT cliprdr's own Start()
-             * thread — so the server-init handshake (Clipboard Capabilities +
-             * Monitor Ready) is never sent automatically. Send it ourselves, or
-             * the client never engages and copy/paste is dead BOTH directions. */
-            CLIPRDR_GENERAL_CAPABILITY_SET general = {
-                .capabilitySetType   = CB_CAPSTYPE_GENERAL,
-                .capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN,
-                .version             = CB_CAPS_VERSION_2,
-                .generalFlags        = CB_USE_LONG_FORMAT_NAMES,
-            };
-            CLIPRDR_CAPABILITIES caps = {
-                .common = { .msgType = CB_CLIP_CAPS, .msgFlags = 0,
-                            .dataLen = 4 + CB_CAPSTYPE_GENERAL_LEN },
-                .cCapabilitiesSets = 1,
-                .capabilitySets = (CLIPRDR_CAPABILITY_SET *)&general,
-            };
-            CLIPRDR_MONITOR_READY ready = { .common = { .msgType = CB_MONITOR_READY } };
-            UINT cc = ctx->cliprdr->ServerCapabilities(ctx->cliprdr, &caps);
-            UINT mr = ctx->cliprdr->MonitorReady(ctx->cliprdr, &ready);
-            rdp_verbose("clipboard channel opened (caps=%u monitor-ready=%u)", cc, mr);
-        }
-    }
+    /* Clipboard (MS-RDPECLIP) — protocol engine lives in protocol/RDPClipboard.c. */
+    ctx->clip = rdp_clip_create(ctx);
 
     /* RDPDR drive-redirection static VC. Gated behind RDP_RDPDR_ENABLED=1. The
      * channel open is best-effort: if the client didn't advertise "rdpdr" in its
@@ -1027,8 +824,8 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
      * FormatDataResponse PDUs are never read off the wire — copy/paste is dead
      * BOTH directions even though our outbound caps/monitor-ready/format-list
      * were sent fine. THIS was the bug. */
-    if (ctx->cliprdr) {
-        HANDLE clipEvent = ctx->cliprdr->GetEventHandle(ctx->cliprdr);
+    if (ctx->clip) {
+        HANDLE clipEvent = (HANDLE)rdp_clip_event(ctx->clip);
         if (clipEvent) events[nCount++] = clipEvent;
     }
 
@@ -1106,34 +903,10 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
-    /* Drain clipboard channel messages. CheckEventHandle == cliprdr_server_read:
-     * it reads one PDU off the static channel and dispatches it to our Client*
-     * callbacks, which themselves write responses (FormatListResponse,
-     * FormatDataRequest/Response) back over the transport — hence it MUST run
-     * under xportLock, which we already hold here. This is what finally lets us
-     * SEE the client engage the clipboard. */
-    if (ok && ctx->cliprdr) {
-        HANDLE clipEvent = ctx->cliprdr->GetEventHandle(ctx->cliprdr);
-        if (clipEvent && WaitForSingleObject(clipEvent, 0) == WAIT_OBJECT_0) {
-            UINT crc = ctx->cliprdr->CheckEventHandle(ctx->cliprdr);
-            if (crc != CHANNEL_RC_OK)
-                rdp_verbose("clipboard read failed: %u", crc);
-        }
-    }
-
-    /* The drain above may have just dispatched the client's Capabilities/Format
-     * List and flipped clipReady. If the host copied something before that
-     * landed, its advertise was skipped — send it now. This runs on the same
-     * thread and under the same lock as every other transport write, which is
-     * why it is here and not in the cliprdr callback: advertising from inside
-     * FreeRDP's own receive dispatch re-enters the cliprdr state machine. */
-    if (ok && ctx->cliprdr && ctx->clipReady && ctx->clipPendingAdvertise &&
-        ctx->clipData) {
-        clip_send_format_list_locked(ctx, ctx->clipFormat);
-        ctx->clipPendingAdvertise = false;
-        rdp_verbose("clipboard: flushed deferred advertise of format 0x%08x "
-                    "(%zu bytes) on handshake", ctx->clipFormat, ctx->clipLen);
-    }
+    /* Drain clipboard channel messages (and flush deferred clipboard sends). The
+     * cliprdr callbacks write responses back over the transport, hence under
+     * xportLock, which we hold here. */
+    if (ok && ctx->clip) rdp_clip_pump(ctx->clip);
 
     /* Drain rdpdr static VC messages (RDP_RDPDR_ENABLED=1 only). */
     if (ok && ctx->rdpdrEvent &&
@@ -1414,52 +1187,9 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
     return rc == CHANNEL_RC_OK;
 }
 
-bool rdp_peer_send_clipboard(freerdp_peer *peer,
-                              const uint8_t *data, size_t len,
-                              uint32_t format) {
+RDPClipboard *rdp_peer_get_clipboard(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->cliprdr) { rdp_verbose("no clipboard channel"); return false; }
-
-    /* Store an owned copy of the host clipboard; we hand it to the client only
-     * when it sends a Format Data Request. Advertising data unsolicited (the
-     * old behaviour) violates MS-RDPECLIP and clients ignore it.
-     *
-     * Thread safety: malloc+copy happens outside the lock (no heap allocation
-     * while holding xportLock keeps the audio thread unblocked). We then
-     * take xportLock for the pointer swap, which is the same lock the reader
-     * (cliprdr_client_format_data_request) holds while accessing clipData/Len.
-     * This prevents a reader from seeing a half-updated clipData/clipLen pair. */
-    uint8_t *newClipData = (uint8_t *)malloc(len ? len : 1);
-    if (!newClipData) { rdp_verbose("clipboard: malloc failed"); return false; }
-    if (len) memcpy(newClipData, data, len);
-    uint8_t *oldClipData;
-    pthread_mutex_lock(&ctx->xportLock);
-    oldClipData      = ctx->clipData;
-    ctx->clipData    = newClipData;
-    ctx->clipLen     = len;
-    ctx->clipFormat  = format;
-    pthread_mutex_unlock(&ctx->xportLock);
-    free(oldClipData);  /* free old buffer AFTER lock released */
-
-    /* Hold the data but DO NOT advertise until the cliprdr handshake is complete.
-     * Calling ServerFormatList before the client has engaged the channel corrupts
-     * FreeRDP's cliprdr send stream and aborts the daemon (the crash-loop that gave
-     * the client 0x904). Flag it instead; the run loop advertises on clipReady. */
-    if (!ctx->clipReady) {
-        pthread_mutex_lock(&ctx->xportLock);
-        ctx->clipPendingAdvertise = true;
-        pthread_mutex_unlock(&ctx->xportLock);
-        rdp_verbose("clipboard: held %zu bytes (fmt 0x%08x) — channel not ready, "
-                    "advertise deferred to handshake", len, format);
-        return true;
-    }
-
-    /* Called from the clipboard poll thread; serialize against the transport. */
-    pthread_mutex_lock(&ctx->xportLock);
-    clip_send_format_list_locked(ctx, format);
-    pthread_mutex_unlock(&ctx->xportLock);
-    rdp_verbose("clipboard: advertised format 0x%08x (%zu bytes held)", format, len);
-    return true;
+    return ctx ? rdp_clip_retain(ctx->clip) : NULL;
 }
 
 /* ── RDPDR (MS-RDPEFS) drive-redirection implementation ─────────────────── */

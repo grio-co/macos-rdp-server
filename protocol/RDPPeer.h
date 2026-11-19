@@ -12,13 +12,13 @@
 #include <freerdp/server/rdpsnd.h>
 #include <freerdp/channels/wtsvc.h>
 #include <winpr/wtsapi.h>
+#include "protocol/RDPClipboard.h"
 
 typedef struct rdp_peer_context RDPPeerContext;
 typedef struct RDPWebDAVServer  RDPWebDAVServer;
 
 typedef void (*RDPPeerInputCallback)(void *userdata, uint16_t flags, uint16_t code);
 typedef void (*RDPPeerMouseCallback)(void *userdata, uint16_t flags, uint16_t x, uint16_t y);
-typedef void (*RDPPeerClipboardCallback)(void *userdata, const uint8_t *data, size_t len, uint32_t format);
 typedef void (*RDPPeerReadyCallback)(void *userdata, uint32_t width, uint32_t height, uint32_t colorDepth);
 typedef void (*RDPPeerKeyframeCallback)(void *userdata);
 
@@ -38,7 +38,6 @@ typedef struct {
     RDPPeerInputCallback     onUnicodeKeyboard;
     RDPPeerMouseCallback     onMouse;
     RDPPeerMouseCallback     onMouseEx;
-    RDPPeerClipboardCallback onClipboard;
     RDPPeerReadyCallback     onReady;
     /* Asks the encoder to emit an IDR keyframe ASAP. Invoked when the GFX channel
      * becomes ready (frames encoded earlier were discarded, so the first sent
@@ -61,7 +60,6 @@ struct rdp_peer_context {
      * resetting the connection (see gfx_caps_advertise). Landing the receive path
      * first makes that blocker diagnosable without risking the session. */
     DispServerContext   *disp;
-    CliprdrServerContext *cliprdr;
     RdpsndServerContext  *rdpsnd;
     uint32_t             surfaceId;
     uint32_t             frameId;    /* monotonic GFX frame id for StartFrame/EndFrame */
@@ -83,16 +81,11 @@ struct rdp_peer_context {
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
-    /* Clipboard: the host's current data, advertised via Format List and held
-     * until the client sends a Format Data Request (MS-RDPECLIP flow). Owned
-     * copy — the source pasteboard pointer is only valid during the send call. */
-    uint8_t             *clipData;
-    size_t               clipLen;
-    uint32_t             clipFormat;
-    /* The format id we asked the client for via ServerFormatDataRequest after it
-     * advertised a Format List (Win->Mac paste). The matching ClientFormatDataResponse
-     * carries no format id of its own, so we remember what we requested. */
-    uint32_t             clipReqFormat;
+    /* Clipboard (MS-RDPECLIP): the whole protocol engine, state and threading rules
+     * live in protocol/RDPClipboard.c. Created in peer_post_connect, pumped from
+     * rdp_peer_run_once (under xportLock), destroyed in context_free. The host
+     * (input/ClipboardSync.m) attaches via rdp_peer_get_clipboard(). */
+    RDPClipboard        *clip;
     /* RDPDR (MS-RDPEFS) drive-redirection static VC. Non-NULL only when
      * RDP_RDPDR_ENABLED=1. Raw WTS channel; protocol state machine runs in C. */
     HANDLE               rdpdrChannel;   /* WTSVirtualChannelOpen handle */
@@ -114,18 +107,6 @@ struct rdp_peer_context {
     /* WebDAV servers — one per redirected drive (RDPDR_MAX_DEVICES slots).
      * Created in DEVICE_LIST_ANNOUNCE; destroyed in context_free. */
     RDPWebDAVServer     *webdavServers[RDPDR_MAX_DEVICES];
-    /* cliprdr handshake complete (client sent its Capabilities/Format List). The
-     * Mac->Win advertise (ServerFormatList, called from the clipboard POLL thread)
-     * MUST NOT run before this — sending a Format List before the channel's send
-     * state is initialized corrupts FreeRDP's cliprdr stream and aborts the daemon
-     * (WinPR Stream_Write_UINT32 assert). Set true in the client caps/format-list
-     * callbacks; gates rdp_peer_send_clipboard. */
-    bool                 clipReady;
-    /* Host clipboard data arrived while clipReady was false, so its advertise was
-     * skipped. The run loop re-advertises once the handshake lands; without this
-     * the held data stays invisible to the client until the NEXT pasteboard
-     * change, which for a copy made during connect may never come. */
-    bool                 clipPendingAdvertise;
     /* AUDIO_INPUT (MS-RDPEAI) mic-redirection channel. Non-NULL only when
      * RDP_AUDIO_INPUT=1. Stored as void* so this C header stays ObjC-free;
      * RDPPeer.c casts it through __bridge when handing it to AudioInput.m.
@@ -187,9 +168,9 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
  * is pitch-shifted). Safe to call from any thread. */
 uint32_t rdp_peer_get_audio_rate(freerdp_peer *peer);
 
-bool rdp_peer_send_clipboard(freerdp_peer *peer,
-                              const uint8_t *data, size_t len,
-                              uint32_t format);
+/* The peer's clipboard engine (see protocol/RDPClipboard.h), RETAINED: balance
+ * with rdp_clip_release(). NULL if the clipboard channel did not open. */
+RDPClipboard *rdp_peer_get_clipboard(freerdp_peer *peer);
 
 /* Tell the client to render the default system pointer CLIENT-SIDE, so the cursor
  * tracks the local mouse smoothly instead of being tied to the (30fps) video. */

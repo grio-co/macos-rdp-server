@@ -1,26 +1,31 @@
 #pragma once
 #import <Foundation/Foundation.h>
+#import "protocol/RDPClipboard.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef void (^ClipboardSendBlock)(const uint8_t *data, size_t len, uint32_t format);
-
-/* CF_TEXT=1, CF_UNICODETEXT=13 — matches Windows clipboard format IDs */
-#define RDP_CB_FORMAT_TEXT        1
-#define RDP_CB_FORMAT_UNICODETEXT 13
-#define RDP_CB_FORMAT_DIB         8
-#define RDP_CB_FORMAT_PNG         0xC004
-
+/*
+ * NSPasteboard side of the clipboard bridge (the MS-RDPECLIP protocol itself is
+ * protocol/RDPClipboard.c).
+ *
+ *   Mac -> Windows: polls NSPasteboard.changeCount (macOS has no change
+ *     notification), advertises every representation it can serve, and renders
+ *     bytes only when the client asks (delayed rendering).
+ *   Windows -> Mac: text is fetched eagerly (small, survives a disconnect); HTML,
+ *     RTF, images and FILES are put on the pasteboard as promises
+ *     (NSPasteboardItemDataProvider) and only transferred when a Mac app pastes.
+ *     Provider callbacks arrive on the MAIN thread, so the daemon's main run loop
+ *     must be running (see daemon/main.m).
+ */
 @interface ClipboardSync : NSObject
 
-@property (nonatomic, copy, nullable) ClipboardSendBlock sendToClientBlock;
+/* Retains `clip` (balance: -stop). */
+- (instancetype)initWithClipboard:(RDPClipboard *)clip;
 
 - (void)start;
+/* Detaches from the protocol engine (no more callbacks after it returns) and
+ * trims the download cache. Idempotent. */
 - (void)stop;
-
-/* Called by RDPSession when client sends clipboard data. */
-- (void)receiveFromClient:(const uint8_t *)data length:(size_t)len
-                   format:(uint32_t)format;
 
 @end
 

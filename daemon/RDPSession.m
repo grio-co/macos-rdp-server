@@ -72,7 +72,6 @@ static const uint32_t kDefaultBitrate = 8000;
         .onUnicodeKeyboard = rdp_on_unicode_keyboard,
         .onMouse     = rdp_on_mouse,
         .onMouseEx   = rdp_on_mouse_ex,
-        .onClipboard = rdp_on_clipboard,
         .onReady     = rdp_on_ready,
         .onKeyframeRequest = rdp_on_keyframe_request,
         .userdata    = (__bridge void *)self,
@@ -166,13 +165,6 @@ static void rdp_on_mouse_ex(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
     rdp_debug("mouse_ex flags=0x%04x x=%u y=%u", flags, x, y);
     [self.injector injectMouseEvent:flags x:x y:y];
-}
-
-static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
-                              uint32_t format) {
-    RDPSession *self = (__bridge RDPSession *)ud;
-    rdp_verbose("clipboard from client: format=0x%08x len=%zu", format, len);
-    [self.clipboard receiveFromClient:data length:len format:format];
 }
 
 static void rdp_on_keyframe_request(void *ud) {
@@ -298,12 +290,14 @@ static void rdp_on_keyframe_request(void *ud) {
     _injector  = [[InputInjector alloc] initWithDisplayID:displayID
                                               sourceWidth:width
                                              sourceHeight:height];
-    _clipboard = [[ClipboardSync alloc] init];
-    _clipboard.sendToClientBlock = ^(const uint8_t *data, size_t len, uint32_t fmt) {
-        rdp_verbose("sending clipboard to client: format=0x%08x len=%zu", fmt, len);
-        rdp_peer_send_clipboard(weak.peer, data, len, fmt);
-    };
-    [_clipboard start];
+    /* Clipboard: the protocol engine lives in the peer; ClipboardSync is the
+     * NSPasteboard side. No clipboard channel (client without cliprdr) -> none. */
+    RDPClipboard *clip = rdp_peer_get_clipboard(_peer);
+    if (clip) {
+        _clipboard = [[ClipboardSync alloc] initWithClipboard:clip];
+        rdp_clip_release(clip);      /* ClipboardSync holds its own reference */
+        [_clipboard start];
+    }
 
     /* Only start audio capture if the client actually declared audio support.
        Saves a CoreAudio IO proc registration for clients that don't want audio. */

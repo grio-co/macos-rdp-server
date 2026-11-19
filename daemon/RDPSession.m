@@ -1,6 +1,7 @@
 #import "daemon/RDPSession.h"
 #import "daemon/DisplayControl.h"
 #import "daemon/Authenticator.h"
+#import "daemon/SecurityPolicy.h"
 #import "protocol/RDPPeer.h"
 #import "display/VirtualDisplay.h"
 #import "display/ScreenCapture.h"
@@ -40,6 +41,9 @@ static const uint32_t kDefaultBitrate = 8000;
  * skip re-authenticating / re-activating on a subsequent Activate (mstsc may
  * re-activate on a resize). Guarded by the serial session queue. */
 @property (nonatomic, assign) BOOL activated;
+/* Per-connection security state: negotiated protocol, auth result, lockout /
+ * idle bookkeeping, audit trail (daemon/SecurityPolicy.m). */
+@property (nonatomic, strong) SecurityConnection *sec;
 @end
 
 @implementation RDPSession
@@ -67,7 +71,9 @@ static const uint32_t kDefaultBitrate = 8000;
 
 - (void)setupAndRun {
     rdp_verbose("creating RDP peer for fd=%d", _fd);
+    _sec = [[SecurityConnection alloc] initWithAddress:_address];
     RDPPeerCallbacks cb = {
+        .onLogon     = rdp_on_logon,
         .onKeyboard  = rdp_on_keyboard,
         .onUnicodeKeyboard = rdp_on_unicode_keyboard,
         .onMouse     = rdp_on_mouse,
@@ -77,6 +83,12 @@ static const uint32_t kDefaultBitrate = 8000;
         .onKeyframeRequest = rdp_on_keyframe_request,
         .userdata    = (__bridge void *)self,
     };
+
+    int nlaMode = 0;
+    NSString *samPath = nil;
+    [_sec getNlaMode:&nlaMode samPath:&samPath];   /* NLA offer (auto/require/off) */
+    cb.security.nlaMode = nlaMode;
+    cb.security.samPath = samPath.UTF8String;
 
     _peer = rdp_peer_create(_fd, &cb);
     if (!_peer) {
@@ -108,6 +120,14 @@ static const uint32_t kDefaultBitrate = 8000;
             [[NSDate date] compare:negoDeadline] == NSOrderedDescending) {
             rdp_info("negotiation timeout (%gs) for %s — dropping stale connection",
                      kNegotiationTimeoutSecs, _address.UTF8String);
+            _sec.endReason = @"negotiation timeout";
+            break;
+        }
+        /* Idle timeout (RDP_IDLE_TIMEOUT_MIN): no keyboard/mouse input for too long. */
+        if (_sessionState == RDPSessionStateActive && [_sec idleTimeoutExceeded]) {
+            rdp_info("idle timeout (%d min without input) — disconnecting %s",
+                     (int)([SecurityPolicy idleTimeoutSeconds] / 60), _address.UTF8String);
+            _sec.endReason = @"idle timeout";
             break;
         }
         /* rdpsnd format negotiation completes asynchronously (Activated callback)
@@ -127,7 +147,26 @@ static const uint32_t kDefaultBitrate = 8000;
         }
     }
 
+    uint32_t selProto = _peer ? freerdp_settings_get_uint32(_peer->context->settings,
+                                                            FreeRDP_SelectedProtocol) : 0;
+    [_sec finishWithSelectedProtocol:selProto
+                         serverEnded:(_sessionState == RDPSessionStateDisconnecting)];
     [self teardown];
+}
+
+/* FreeRDP Logon hook → SecurityConnection (negotiated protocol; for NLA also the
+ * CredSSP-delegated credentials). A rejection marks the session Disconnecting so
+ * the peer loop exits before the MCS/capability exchange proceeds. */
+static bool rdp_on_logon(void *ud, bool nla, uint32_t proto, const char *user,
+                         const char *domain, const char *password) {
+    RDPSession *self = (__bridge RDPSession *)ud;
+    BOOL ok = [self.sec handleLogonNla:nla ? YES : NO
+                      selectedProtocol:proto
+                                  user:user ? [NSString stringWithUTF8String:user] : nil
+                                domain:domain ? [NSString stringWithUTF8String:domain] : nil
+                              password:password ? [NSString stringWithUTF8String:password] : nil];
+    if (!ok) self->_sessionState = RDPSessionStateDisconnecting;
+    return ok;
 }
 
 static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
@@ -143,18 +182,21 @@ static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
 
 static void rdp_on_keyboard(void *ud, uint16_t flags, uint16_t code) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("key flags=0x%04x code=0x%02x", flags, code);
     [self.injector injectKeyEvent:flags scanCode:code];
 }
 
 static void rdp_on_unicode_keyboard(void *ud, uint16_t flags, uint16_t code) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("unicode key flags=0x%04x code=U+%04X", flags, code);
     [self.injector injectUnicodeKeyEvent:flags code:code];
 }
 
 static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("mouse flags=0x%04x x=%u y=%u", flags, x, y);
     if (flags & (RDP_PTR_WHEEL | RDP_PTR_HWHEEL))
         [self.injector injectMouseWheelEvent:flags x:x y:y];
@@ -164,6 +206,7 @@ static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
 
 static void rdp_on_mouse_ex(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("mouse_ex flags=0x%04x x=%u y=%u", flags, x, y);
     [self.injector injectMouseEvent:flags x:x y:y];
 }
@@ -208,14 +251,18 @@ static void rdp_on_keyframe_request(void *ud) {
     NSString *pass   = cpass   ? [NSString stringWithUTF8String:cpass]   : nil;
     NSString *domain = cdomain ? [NSString stringWithUTF8String:cdomain] : nil;
 
-    if (![Authenticator validateUsername:user password:pass domain:domain]) {
+    /* NLA connections were already verified in the Logon hook (CredSSP delivered
+     * the cleartext password; it was re-checked against OpenDirectory there), so
+     * the Client Info PDU carries nothing to prompt for. TLS connections are
+     * verified here, with lockout, allowed-user and audit handling inside
+     * SecurityConnection. */
+    if (![_sec authenticateWithUser:user password:pass domain:domain]) {
         rdp_error("authentication FAILED for %s (user='%s') — rejecting connection",
                   _address.UTF8String, user.length ? user.UTF8String : "(none)");
         _sessionState = RDPSessionStateDisconnecting;
         return NO;  /* peer loop sees Disconnecting and exits → teardown, no display */
     }
-    rdp_info("authentication OK for %s (user='%s')",
-             _address.UTF8String, user.length ? user.UTF8String : "(none)");
+    [_sec markActive];
     return YES;
 }
 

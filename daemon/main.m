@@ -9,6 +9,7 @@
 #import "daemon/RDPServer.h"
 #import "daemon/RDPSession.h"
 #import "daemon/AutoUpdate.h"
+#import "daemon/SecurityPolicy.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
 
@@ -49,6 +50,10 @@ static void print_usage(const char *prog) {
         "Usage: %s [options]\n"
         "  --port <n>            TCP port to listen on (default: 3389)\n"
         "  --log-level <l>       error|info|verbose|debug (default: info)\n"
+        "  --bind <addr>         listen address: IPv4, IPv6, localhost (default: all, dual-stack;\n"
+        "                        env RDP_BIND_ADDRESS)\n"
+        "  --set-nla-password [user]  verify the Mac password and store its NLA (NTLM) hash, then exit\n"
+        "  --clear-nla [user]    remove the stored NLA hash for the user, then exit\n"
         "  --check-permissions   report Screen Recording + Accessibility state, then exit\n",
         prog);
 }
@@ -72,6 +77,15 @@ int main(int argc, char *argv[]) {
                 int lvl = rdp_log_level_from_string(argv[++i]);
                 if (lvl >= 0) rdp_log_set_level((RDPLogLevel)lvl);
                 else { fprintf(stderr, "Unknown log level '%s'\n", argv[i]); return 1; }
+            } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+                [SecurityPolicy setBindAddress:[NSString stringWithUTF8String:argv[++i]]];
+            } else if (strcmp(argv[i], "--set-nla-password") == 0 ||
+                       strcmp(argv[i], "--clear-nla") == 0) {
+                BOOL set = (strcmp(argv[i], "--set-nla-password") == 0);
+                NSString *who = (i + 1 < argc && argv[i + 1][0] != '-')
+                    ? [NSString stringWithUTF8String:argv[i + 1]] : nil;
+                return set ? [SecurityPolicy runSetNlaPassword:who]
+                           : [SecurityPolicy runClearNla:who];
             } else if (strcmp(argv[i], "--check-permissions") == 0) {
                 return check_permissions();
             } else if (strcmp(argv[i], "--help") == 0) {

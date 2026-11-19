@@ -50,3 +50,7 @@ clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_input_logic.c" 
 clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_flowcontrol.c" \
     "$ROOT/protocol/RDPFlowControl.c" -o "$OUT/test_flowcontrol"
 "$OUT/test_flowcontrol"
+
+clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_ima.c" \
+    "$ROOT/audio/ImaAdpcm.c" -lm -o "$OUT/test_ima"
+"$OUT/test_ima"

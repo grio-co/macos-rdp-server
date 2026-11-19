@@ -5,6 +5,7 @@
 #include <pthread.h>
 
 #include "protocol/RDPFlowControl.h"
+#include "audio/ImaAdpcm.h"
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
 #include <freerdp/server/rdpgfx.h>
@@ -159,6 +160,12 @@ struct rdp_peer_context {
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
+    /* Negotiated IMA ADPCM (RDP_AUDIO_CODEC=auto): our own encoder, blocks sent
+     * with SendSamples2. Used only from the audio thread after audioReady. */
+    bool                 imaActive;
+    ImaEncoder           ima;
+    uint8_t             *imaBuf;
+    size_t               imaCap;
     /* Clipboard (MS-RDPECLIP): the whole protocol engine, state and threading rules
      * live in protocol/RDPClipboard.c. Created in peer_post_connect, pumped from
      * rdp_peer_run_once (under xportLock), destroyed in context_free. The host

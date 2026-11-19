@@ -319,6 +319,8 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     /* Fails any paste still waiting on the client, waits for in-flight users, frees the channel. */
     if (c->clip)   { rdp_clip_destroy(c->clip);              c->clip   = NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
+    if (c->imaActive) { c->imaActive = false; ima_encoder_free(&c->ima); }
+    free(c->imaBuf); c->imaBuf = NULL; c->imaCap = 0;
     /* Audio input (MS-RDPEAI) — close and release the ObjC object. */
     if (c->audioInput) { rdp_audio_input_close(c->audioInput); c->audioInput = NULL; }
     /* Close rdpdr raw WTS channel (opened when RDP_RDPDR_ENABLED=1). */
@@ -611,6 +613,44 @@ static uint32_t rdp_preferred_audio_rate(void) {
     return 44100;
 }
 
+/* RDP_AUDIO_CODEC: "auto" (default) prefers IMA ADPCM (4:1, about 353 kbps for
+ * 44.1 kHz stereo vs 1411 kbps PCM) when the client offers it and PCM otherwise;
+ * "pcm" forces PCM. */
+static bool rdp_audio_adpcm_allowed(void) {
+    const char *e = getenv("RDP_AUDIO_CODEC");
+    if (!e || !*e || strcmp(e, "auto") == 0) return true;
+    if (strcmp(e, "pcm") != 0)
+        rdp_info("RDP_AUDIO_CODEC=\"%s\" not recognized (auto|pcm) - using auto", e);
+    return strcmp(e, "pcm") != 0;
+}
+
+/* A client format we can serve from the server list: same tag/channels/rate/bits
+ * as a server format, and for ADPCM a block size our encoder can produce. */
+static bool audio_client_format_usable(RdpsndServerContext *r, UINT16 i, bool adpcm) {
+    const AUDIO_FORMAT *cf = &r->client_formats[i];
+    if (adpcm) {
+        if (cf->wFormatTag != WAVE_FORMAT_DVI_ADPCM || cf->nChannels != 2 ||
+            cf->wBitsPerSample != 4 || r->clientVersion < 8)   /* Wave2 PDU needed */
+            return false;
+        int ba = (int)cf->nBlockAlign;
+        if (ba < 16 || ba > 8192 || (ba - 8) % 8) return false;
+    } else if (cf->wFormatTag != WAVE_FORMAT_PCM) {
+        return false;
+    }
+    for (size_t j = 0; j < r->num_server_formats; j++)
+        if (audio_format_compatible(&r->server_formats[j], cf)) return true;
+    return false;
+}
+
+/* First usable client format of the wanted kind at `rate` (0 = any rate). */
+static int audio_find_format(RdpsndServerContext *r, uint32_t rate, bool adpcm) {
+    for (UINT16 i = 0; i < r->num_client_formats; i++)
+        if ((rate == 0 || r->client_formats[i].nSamplesPerSec == rate) &&
+            audio_client_format_usable(r, i, adpcm))
+            return (int)i;
+    return -1;
+}
+
 static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     RDPPeerContext *ctx = (RDPPeerContext *)rdpsnd->data;
 
@@ -659,33 +699,20 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
              preferred ? (preferred == 44100 ? "44100" :
                           preferred == 48000 ? "48000" : "22050") : "auto");
 
+    /* Order: preferred rate (ADPCM, then PCM), then any rate (ADPCM, then PCM).
+     * Rate always wins over codec: ADPCM keeps the same rate and channels as the
+     * PCM it replaces, so the pitch constraint above holds for both. */
+    const bool adpcmOk = rdp_audio_adpcm_allowed();
     int chosen = -1;
-    /* Pass 1: preferred rate (skipped when preferred == 0 / "auto"). */
     if (preferred) {
-        for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
-            if (rdpsnd->client_formats[i].nSamplesPerSec != preferred) continue;
-            for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
-                if (audio_format_compatible(&rdpsnd->server_formats[j],
-                                            &rdpsnd->client_formats[i])) {
-                    chosen = (int)i;
-                    break;
-                }
-            }
-        }
+        if (adpcmOk) chosen = audio_find_format(rdpsnd, preferred, true);
+        if (chosen < 0) chosen = audio_find_format(rdpsnd, preferred, false);
         if (chosen < 0)
             rdp_info("no compatible client format at preferred %u Hz — "
                      "falling back to first compatible format", preferred);
     }
-    /* Pass 2: first compatible format of any rate. */
-    for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
-        for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
-            if (audio_format_compatible(&rdpsnd->server_formats[j],
-                                        &rdpsnd->client_formats[i])) {
-                chosen = (int)i;
-                break;
-            }
-        }
-    }
+    if (chosen < 0 && adpcmOk) chosen = audio_find_format(rdpsnd, 0, true);
+    if (chosen < 0) chosen = audio_find_format(rdpsnd, 0, false);
 
     if (chosen < 0) {
         rdp_error("no compatible audio format found among %u client formats",
@@ -694,6 +721,24 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     }
 
     const AUDIO_FORMAT *sel = &rdpsnd->client_formats[chosen];
+    const bool useIma = (sel->wFormatTag == WAVE_FORMAT_DVI_ADPCM);
+    if (useIma) {
+        /* src_format describes the PCM we hand over: the server PCM format at
+         * the same rate and channels as the chosen client format. */
+        const AUDIO_FORMAT *pcmSrc = NULL;
+        for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
+            const AUDIO_FORMAT *sf = &rdpsnd->server_formats[j];
+            if (sf->wFormatTag == WAVE_FORMAT_PCM && sf->nChannels == sel->nChannels &&
+                sf->nSamplesPerSec == sel->nSamplesPerSec) { pcmSrc = sf; break; }
+        }
+        if (!pcmSrc || ima_encoder_init(&ctx->ima, sel->nChannels, (int)sel->nBlockAlign) != 0) {
+            rdp_error("IMA ADPCM setup failed - audio disabled");
+            return;
+        }
+        rdpsnd->src_format = (AUDIO_FORMAT *)pcmSrc;
+        ctx->imaActive = true;
+    }
+    if (!useIma)
     /* Point src_format at the selected client format BEFORE SelectFormat —
      * SelectFormat reads src_format to compute src bytes-per-frame, and it is
      * the format SendSamples describes the PCM with, so it MUST equal the
@@ -718,6 +763,8 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     }
 
     ctx->audioReady = true;
+    rdp_info("audio codec: %s (RDP_AUDIO_CODEC=%s)",
+             useIma ? "IMA ADPCM (4:1)" : "PCM", adpcmOk ? "auto" : "pcm");
     rdp_info("audio format negotiated: client idx %d (committed %u) — "
              "%u Hz, %u ch, %u-bit, tag 0x%04x — wire wFormatNo=%u, "
              "tap will resample to %u Hz (src=play rate)",
@@ -803,9 +850,10 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     rdp_peer_open_rdpdr(peer);
 
     /* Audio. Advertise raw PCM stereo 16-bit at the standard rates mstsc
-     * expects (48000 / 44100 / 22050). We DELIBERATELY offer only raw PCM, no
-     * compressed codecs (AAC/ADPCM/GSM): our SendSamples feeds raw PCM, so a
-     * negotiated codec would hand the client undecodable garbage.
+     * expects (48000 / 44100 / 22050), plus the same rates as IMA ADPCM unless
+     * RDP_AUDIO_CODEC=pcm. Only PCM and IMA ADPCM are offered: nothing else can
+     * be produced here (FreeRDP's own ADPCM/MS-ADPCM encoders are compiled out
+     * and broken in this build, so IMA is encoded by audio/ImaAdpcm.c).
      *
      * Why multiple rates (the pitch fix): rdpsnd_server_send_samples() does not
      * resample — the client plays our bytes at the SELECTED CLIENT FORMAT's
@@ -825,16 +873,37 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     ctx->rdpsnd = rdpsnd_server_context_new(ctx->vcm);
     if (ctx->rdpsnd) {
         static const UINT32 kRates[] = { 48000, 44100, 22050 };
-        const size_t nFmt = sizeof(kRates) / sizeof(kRates[0]);
+        const size_t nRates = sizeof(kRates) / sizeof(kRates[0]);
+        /* PCM first, then (unless RDP_AUDIO_CODEC=pcm) the same rates as IMA
+         * ADPCM with the standard Windows block size. The ADPCM entries carry
+         * cbSize=2 + samples-per-block as WAVEFORMATEX requires; the data
+         * pointers are static (FreeRDP frees only the array). */
+        static BYTE imaExtra[3][2];
+        const bool withIma = rdp_audio_adpcm_allowed();
+        const size_t nFmt = withIma ? 2 * nRates : nRates;
         AUDIO_FORMAT *pcm = (AUDIO_FORMAT *)calloc(nFmt, sizeof(AUDIO_FORMAT));
         if (pcm) {
-            for (size_t k = 0; k < nFmt; k++) {
+            for (size_t k = 0; k < nRates; k++) {
                 pcm[k].wFormatTag      = WAVE_FORMAT_PCM;
                 pcm[k].nChannels       = 2;
                 pcm[k].nSamplesPerSec  = kRates[k];
                 pcm[k].nAvgBytesPerSec = kRates[k] * 2 * 2;
                 pcm[k].nBlockAlign     = 2 * 2;
                 pcm[k].wBitsPerSample  = 16;
+                if (!withIma) continue;
+                AUDIO_FORMAT *a = &pcm[nRates + k];
+                int ba = ima_block_align(2, kRates[k]);
+                int spb = ima_samples_per_block(2, ba);
+                imaExtra[k][0] = (BYTE)(spb & 0xFF);
+                imaExtra[k][1] = (BYTE)(spb >> 8);
+                a->wFormatTag      = WAVE_FORMAT_DVI_ADPCM;
+                a->nChannels       = 2;
+                a->nSamplesPerSec  = kRates[k];
+                a->nBlockAlign     = (UINT16)ba;
+                a->nAvgBytesPerSec = (UINT32)((uint64_t)kRates[k] * (uint64_t)ba / (uint64_t)spb);
+                a->wBitsPerSample  = 4;
+                a->cbSize          = 2;
+                a->data            = imaExtra[k];
             }
         }
         ctx->rdpsnd->data               = ctx;
@@ -849,7 +918,8 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
             rdp_verbose("audio channel init failed");
             rdpsnd_server_context_free(ctx->rdpsnd);
             ctx->rdpsnd = NULL;
-        } else { rdp_verbose("audio channel opened (PCM 48000/44100/22050)"); }
+        } else { rdp_verbose("audio channel opened (PCM%s 48000/44100/22050)",
+                             withIma ? " + IMA ADPCM" : ""); }
     }
 
     /* Audio input (MS-RDPEAI mic redirection). Gated behind RDP_AUDIO_INPUT=1.
@@ -1560,6 +1630,23 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->rdpsnd || !ctx->audioReady) return false;
+    if (ctx->imaActive) {
+        /* Encode here (audio thread only), send finished blocks as a Wave2 PDU. */
+        size_t need = ima_max_output(&ctx->ima, frame_count);
+        if (need == 0) { (void)ima_encode(&ctx->ima, samples, frame_count, NULL, 0); return true; }
+        if (ctx->imaCap < need) {
+            uint8_t *nb = (uint8_t *)realloc(ctx->imaBuf, need);
+            if (!nb) return false;
+            ctx->imaBuf = nb; ctx->imaCap = need;
+        }
+        size_t n = ima_encode(&ctx->ima, samples, frame_count, ctx->imaBuf, ctx->imaCap);
+        if (n == 0) return true;
+        pthread_mutex_lock(&ctx->xportLock);
+        UINT rc2 = ctx->rdpsnd->SendSamples2(ctx->rdpsnd, ctx->rdpsnd->selected_client_format,
+                                             ctx->imaBuf, n, 0, 0);
+        pthread_mutex_unlock(&ctx->xportLock);
+        return rc2 == CHANNEL_RC_OK;
+    }
     /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature.
      * Audio runs on its own capture thread; serialize against the transport. */
     pthread_mutex_lock(&ctx->xportLock);

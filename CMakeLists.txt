@@ -113,6 +113,7 @@ add_executable(macos-rdp-daemon
     audio/AudioCapture.m
     audio/AudioInput.m
     audio/AudioRedirect.c
+    audio/ImaAdpcm.c
 )
 
 target_include_directories(macos-rdp-daemon PRIVATE

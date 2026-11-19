@@ -280,6 +280,12 @@ static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
     pthread_mutexattr_init(&mattr);
     pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&c->xportLock, &mattr);
+    rdp_fc_init(&c->fc);
+    {
+        const char *w = getenv("RDP_GFX_MAX_INFLIGHT");
+        int n = w ? atoi(w) : 0;
+        if (n >= 1 && n <= 16) c->fc.maxInFlight = (uint32_t)n;
+    }
     pthread_mutexattr_destroy(&mattr);
     /* Open the Virtual Channel Manager — all dynamic channels live under it. */
     c->vcm = WTSOpenServerA((LPSTR)peer->context);
@@ -322,6 +328,7 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
         c->rdpdrEvent   = NULL;
     }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
+    rdp_fc_destroy(&c->fc);
     pthread_mutex_destroy(&c->xportLock);
     rdp_debug("peer context freed");
 }
@@ -392,6 +399,8 @@ static void gfx_rebuild_surfaces_locked(RDPPeerContext *ctx) {
         (void)gfx->DeleteSurface(gfx, &ds);
     }
     ctx->surfaceCount = 0;
+    /* Frames sent for the old surfaces may never be acked. */
+    rdp_fc_reset(&ctx->fc);
 
     if (!ctx->legacyGfx) {
         MONITOR_DEF defs[RDP_MAX_MONITORS];
@@ -446,6 +455,28 @@ static void gfx_rebuild_surfaces_locked(RDPPeerContext *ctx) {
              ctx->legacyGfx ? " (legacy: no ResetGraphics)" : "");
 }
 
+
+/* MS-RDPEGFX FRAME_ACKNOWLEDGE. Runs on the run-loop thread inside the VCM pump
+ * (xportLock held); only touches the flow-control state, which has its own lock. */
+static UINT gfx_frame_acknowledge(RdpgfxServerContext *gfx,
+                                  const RDPGFX_FRAME_ACKNOWLEDGE_PDU *ack) {
+    RDPPeerContext *ctx = (RDPPeerContext *)gfx->custom;
+    rdp_fc_on_ack(&ctx->fc, ack->frameId, ack->queueDepth, mono_ms());
+    return CHANNEL_RC_OK;
+}
+
+bool rdp_peer_gfx_can_send(freerdp_peer *peer) {
+    if (!peer) return true;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    return rdp_fc_can_send(&ctx->fc, mono_ms());
+}
+
+uint32_t rdp_peer_gfx_rate_step(freerdp_peer *peer, bool *changed,
+                                uint32_t *maxInFlight, double *latencyMs) {
+    if (!peer) { if (changed) *changed = false; return 1000; }
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    return rdp_fc_rate_step(&ctx->fc, changed, maxInFlight, latencyMs);
+}
 
 static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
                                 const RDPGFX_CAPS_ADVERTISE_PDU *pdu) {
@@ -723,6 +754,7 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     if (!ctx->gfx) { rdp_error("rdpgfx_server_context_new failed"); return FALSE; }
     ctx->gfx->custom        = ctx;
     ctx->gfx->CapsAdvertise = gfx_caps_advertise;
+    ctx->gfx->FrameAcknowledge = gfx_frame_acknowledge;
     ctx->nextSurfaceId      = 1;
     {
         const char *gr = getenv("RDP_GFX_RESET");
@@ -1360,6 +1392,7 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     RDPGFX_END_FRAME_PDU   endFrame   = { .frameId = fid };
 
     UINT rc = ctx->gfx->SurfaceFrameCommand(ctx->gfx, &cmd, &startFrame, &endFrame);
+    if (rc == CHANNEL_RC_OK) rdp_fc_on_send(&ctx->fc, fid, mono_ms());
     if (rc != CHANNEL_RC_OK) {
         rdp_error("SurfaceFrameCommand failed: %u", rc);
         ok = false;

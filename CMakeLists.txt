@@ -96,6 +96,7 @@ add_executable(macos-rdp-daemon
     daemon/AutoUpdate.m
     daemon/FileProvider/RDPFileProvider.m
     protocol/RDPPeer.c
+    protocol/RDPFlowControl.c
     protocol/RDPClipboard.c
     protocol/RDPClipboardCodec.c
     protocol/RDPClipboardFiles.c

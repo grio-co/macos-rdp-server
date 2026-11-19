@@ -43,6 +43,8 @@ static uint32_t bitrate_for(uint32_t w, uint32_t h) {
     os_unfair_lock _pipeLock;
     NSArray<RDPMonitorPipeline *> *_pipelines;
     RDPMonitorLayout _layout;          /* what the client is being served */
+    dispatch_source_t _rateTimer;      /* adaptive bitrate tick (session queue) */
+    uint32_t _rateScale;               /* permille of bitrate_for(); session queue */
 }
 @property (nonatomic, assign) int fd;
 @property (nonatomic, assign) RDPSessionState sessionState;
@@ -504,7 +506,7 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
         p.display = displays[i];
 
         p.encoder = [[FrameEncoder alloc] initWithWidth:fw height:fh
-                                                bitrate:bitrate_for(fw, fh)];
+                                                bitrate:bitrate_for(fw, fh) * (_rateScale ?: 1000) / 1000];
         p.encoder.outputHandler = ^(const uint8_t *data, size_t len, BOOL keyFrame,
                                     uint16_t dx, uint16_t dy, uint16_t dw, uint16_t dh) {
             freerdp_peer *peer = weak.peer;
@@ -516,9 +518,18 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
 
         p.capture = [[ScreenCapture alloc] initWithDisplayID:p.display.displayID];
         __weak FrameEncoder *wenc = p.encoder;
+        __weak ScreenCapture *wcap = p.capture;
         p.capture.frameHandler = ^(IOSurfaceRef surface, uint32_t cw, uint32_t ch,
                                    CGRect dirty) {
             (void)cw; (void)ch;
+            /* Flow control BEFORE encoding: a frame already encoded is never
+             * dropped (it would break the H.264 reference chain). Skipping is
+             * safe because every frame covers the whole surface. */
+            freerdp_peer *fp = weak.peer;
+            if (fp && !rdp_peer_gfx_can_send(fp)) {
+                [wcap refeedLastFrameAfterMs:16];
+                return;
+            }
             uint16_t dx = (uint16_t)MAX(0.0, dirty.origin.x);
             uint16_t dy = (uint16_t)MAX(0.0, dirty.origin.y);
             uint16_t dw = (uint16_t)MIN((double)fw, dirty.size.width);
@@ -535,6 +546,7 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
                  p.display.hiDPI ? " HiDPI" : "", m->primary ? " primary" : "");
     }
     [self publishPipelines:pipes];
+    [self startRateTimer];
 
     if (allVirtual) {
         CGRect rects[RDP_MAX_MONITORS];
@@ -570,7 +582,37 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     return rc == 0;
 }
 
+/* Adaptive bitrate: every 500 ms look at the GFX ack pressure and move the encoders'
+ * average bitrate between 15% and 100% of bitrate_for(). Session queue. */
+- (void)startRateTimer {
+    if (_rateTimer) return;
+    if (!_rateScale) _rateScale = 1000;
+    _rateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _sessionQueue);
+    dispatch_source_set_timer(_rateTimer, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                              500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    __weak typeof(self) weak = self;
+    dispatch_source_set_event_handler(_rateTimer, ^{
+        typeof(self) s = weak;
+        if (!s || !s->_peer) return;
+        bool changed = false; uint32_t maxIf = 0; double lat = 0;
+        uint32_t scale = rdp_peer_gfx_rate_step(s->_peer, &changed, &maxIf, &lat);
+        if (!changed) return;
+        s->_rateScale = scale;
+        for (RDPMonitorPipeline *p in [s pipelineSnapshot]) {
+            uint32_t target = bitrate_for(p.encoder.width, p.encoder.height);
+            uint32_t kbps = MAX(target * scale / 1000, 300u);
+            uint32_t old = p.encoder.bitrateKbps;
+            [p.encoder setBitrateKbps:kbps];
+            rdp_verbose("adaptive bitrate: %u -> %u kbps (target %u, scale %u/1000, "
+                        "ack latency %.0f ms, peak in-flight %u)",
+                        old, kbps, target, scale, lat, maxIf);
+        }
+    });
+    dispatch_resume(_rateTimer);
+}
+
 - (void)teardown {
+    if (_rateTimer) { dispatch_source_cancel(_rateTimer); _rateTimer = nil; }
     rdp_verbose("tearing down session for %s", _address.UTF8String);
     [_injector releaseAll];   /* never leave Cmd or a mouse button held */
     [_cursor stop];

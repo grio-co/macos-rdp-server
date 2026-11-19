@@ -43,7 +43,8 @@ static uint32_t bitrate_for(uint32_t w, uint32_t h) {
     os_unfair_lock _pipeLock;
     NSArray<RDPMonitorPipeline *> *_pipelines;
     RDPMonitorLayout _layout;          /* what the client is being served */
-    dispatch_source_t _rateTimer;      /* adaptive bitrate tick (session queue) */
+    dispatch_source_t _rateTimer;      /* adaptive bitrate tick */
+    dispatch_queue_t  _rateQueue;
     uint32_t _rateScale;               /* permille of bitrate_for(); session queue */
 }
 @property (nonatomic, assign) int fd;
@@ -527,7 +528,7 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
              * safe because every frame covers the whole surface. */
             freerdp_peer *fp = weak.peer;
             if (fp && !rdp_peer_gfx_can_send(fp)) {
-                [wcap refeedLastFrameAfterMs:16];
+                [wcap refeedLastFrameAfterMs:33];
                 return;
             }
             uint16_t dx = (uint16_t)MAX(0.0, dirty.origin.x);
@@ -583,19 +584,24 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
 }
 
 /* Adaptive bitrate: every 500 ms look at the GFX ack pressure and move the encoders'
- * average bitrate between 15% and 100% of bitrate_for(). Session queue. */
+ * average bitrate between 15% and 100% of bitrate_for(). */
 - (void)startRateTimer {
     if (_rateTimer) return;
     if (!_rateScale) _rateScale = 1000;
-    _rateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _sessionQueue);
+    /* Not the session queue: the peer loop occupies it for the whole session. */
+    _rateQueue = dispatch_queue_create("com.macosrdp.rate", DISPATCH_QUEUE_SERIAL);
+    _rateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _rateQueue);
     dispatch_source_set_timer(_rateTimer, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
                               500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     __weak typeof(self) weak = self;
     dispatch_source_set_event_handler(_rateTimer, ^{
         typeof(self) s = weak;
         if (!s || !s->_peer) return;
-        bool changed = false; uint32_t maxIf = 0; double lat = 0;
-        uint32_t scale = rdp_peer_gfx_rate_step(s->_peer, &changed, &maxIf, &lat);
+        bool changed = false; uint32_t maxIf = 0, skips = 0; double lat = 0;
+        uint32_t scale = rdp_peer_gfx_rate_step(s->_peer, &changed, &maxIf, &lat, &skips);
+        if (skips > 0 || maxIf > 3)
+            rdp_verbose("flow: peak in-flight %u, %u capture(s) skipped, ack latency %.0f ms",
+                        maxIf, skips, lat);
         if (!changed) return;
         s->_rateScale = scale;
         for (RDPMonitorPipeline *p in [s pipelineSnapshot]) {
@@ -612,7 +618,11 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
 }
 
 - (void)teardown {
-    if (_rateTimer) { dispatch_source_cancel(_rateTimer); _rateTimer = nil; }
+    if (_rateTimer) {
+        dispatch_source_cancel(_rateTimer);
+        dispatch_sync(_rateQueue, ^{});   /* a running tick finishes before the peer goes */
+        _rateTimer = nil;
+    }
     rdp_verbose("tearing down session for %s", _address.UTF8String);
     [_injector releaseAll];   /* never leave Cmd or a mouse button held */
     [_cursor stop];

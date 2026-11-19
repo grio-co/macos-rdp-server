@@ -50,4 +50,4 @@ uint32_t rdp_fc_in_flight(RDPFlowControl *fc);
  * stats it consumed (since the previous step) are returned in the out params
  * when non-NULL. */
 uint32_t rdp_fc_rate_step(RDPFlowControl *fc, bool *changed,
-                          uint32_t *maxInFlight, double *latencyMs);
+                          uint32_t *maxInFlight, double *latencyMs, uint32_t *skips);

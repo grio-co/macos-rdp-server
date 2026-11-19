@@ -264,7 +264,7 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
 bool rdp_peer_gfx_can_send(freerdp_peer *peer);
 /* Rate step, every ~500 ms. Returns the bitrate scale in permille of the target. */
 uint32_t rdp_peer_gfx_rate_step(freerdp_peer *peer, bool *changed,
-                                uint32_t *maxInFlight, double *latencyMs);
+                                uint32_t *maxInFlight, double *latencyMs, uint32_t *skips);
 
 bool rdp_peer_send_bitmap(freerdp_peer *peer,
                            const uint8_t *bgra, uint32_t x, uint32_t y,

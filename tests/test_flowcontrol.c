@@ -54,18 +54,18 @@ int main(void) {
     bool ch; uint32_t s;
     for (uint32_t i = 1; i <= 3; i++) rdp_fc_on_send(&r, i, 0);
     (void)rdp_fc_can_send(&r, 10);          /* a skip */
-    s = rdp_fc_rate_step(&r, &ch, NULL, NULL);
+    s = rdp_fc_rate_step(&r, &ch, NULL, NULL, NULL);
     CHECK(ch && s == 700);
     (void)rdp_fc_can_send(&r, 20);
-    s = rdp_fc_rate_step(&r, &ch, NULL, NULL);
+    s = rdp_fc_rate_step(&r, &ch, NULL, NULL, NULL);
     CHECK(s == 490);
-    for (int i = 0; i < 30; i++) { (void)rdp_fc_can_send(&r, 30); s = rdp_fc_rate_step(&r, &ch, NULL, NULL); }
+    for (int i = 0; i < 30; i++) { (void)rdp_fc_can_send(&r, 30); s = rdp_fc_rate_step(&r, &ch, NULL, NULL, NULL); }
     CHECK(s == 150);                         /* floor */
     rdp_fc_on_ack(&r, 3, 0, 40);             /* link recovers: fast acks */
     for (int i = 0; i < 60; i++) {
         uint32_t id = r.sentId + 1;
         rdp_fc_on_send(&r, id, 50 + i); rdp_fc_on_ack(&r, id, 0, 51 + i);
-        s = rdp_fc_rate_step(&r, &ch, NULL, NULL);
+        s = rdp_fc_rate_step(&r, &ch, NULL, NULL, NULL);
     }
     CHECK(s == 1000);                        /* back at target */
     /* high ack latency alone lowers it */
@@ -73,7 +73,7 @@ int main(void) {
         uint32_t id = r.sentId + 1;
         rdp_fc_on_send(&r, id, 1000); rdp_fc_on_ack(&r, id, 0, 1400);
     }
-    s = rdp_fc_rate_step(&r, &ch, NULL, NULL);
+    s = rdp_fc_rate_step(&r, &ch, NULL, NULL, NULL);
     CHECK(ch && s < 1000);
     rdp_fc_destroy(&r);
     rdp_fc_destroy(&fc);

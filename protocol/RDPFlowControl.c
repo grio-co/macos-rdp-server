@@ -85,7 +85,7 @@ uint32_t rdp_fc_in_flight(RDPFlowControl *fc) {
 }
 
 uint32_t rdp_fc_rate_step(RDPFlowControl *fc, bool *changed,
-                          uint32_t *maxInFlight, double *latencyMs) {
+                          uint32_t *maxInFlight, double *latencyMs, uint32_t *skips) {
     pthread_mutex_lock(&fc->lock);
     uint32_t old = fc->scalePermille;
     bool pressure = fc->skips > 0 ||
@@ -104,6 +104,7 @@ uint32_t rdp_fc_rate_step(RDPFlowControl *fc, bool *changed,
     }
     if (maxInFlight) *maxInFlight = fc->maxInFlightSeen;
     if (latencyMs) *latencyMs = fc->latencyEwmaMs;
+    if (skips) *skips = fc->skips;
     fc->skips = 0; fc->acks = 0; fc->maxInFlightSeen = 0;
     uint32_t s = fc->scalePermille;
     pthread_mutex_unlock(&fc->lock);

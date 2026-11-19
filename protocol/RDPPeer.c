@@ -472,10 +472,10 @@ bool rdp_peer_gfx_can_send(freerdp_peer *peer) {
 }
 
 uint32_t rdp_peer_gfx_rate_step(freerdp_peer *peer, bool *changed,
-                                uint32_t *maxInFlight, double *latencyMs) {
+                                uint32_t *maxInFlight, double *latencyMs, uint32_t *skips) {
     if (!peer) { if (changed) *changed = false; return 1000; }
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    return rdp_fc_rate_step(&ctx->fc, changed, maxInFlight, latencyMs);
+    return rdp_fc_rate_step(&ctx->fc, changed, maxInFlight, latencyMs, skips);
 }
 
 static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,

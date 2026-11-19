@@ -18,7 +18,7 @@ permissions:
 jobs:
   build-check:
     name: Compile check (arm64)
-    runs-on: macos-14
+    runs-on: macos-15
     outputs:
       sha: ${{ steps.ver.outputs.sha }}
 
@@ -117,7 +117,7 @@ jobs:
   # Independent of the daemon build above so it can never break it.
   build-gui:
     name: Compile GUI config app (Swift)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
@@ -139,7 +139,7 @@ jobs:
     name: Publish auto-update release
     needs: build-check
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: write
     steps:

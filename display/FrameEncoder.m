@@ -1,4 +1,5 @@
 #import "display/FrameEncoder.h"
+#import "display/ScreenCapture.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <IOSurface/IOSurface.h>
@@ -9,7 +10,7 @@
 @property (nonatomic, assign) VTCompressionSessionRef session;
 @property (nonatomic, assign) uint32_t w;
 @property (nonatomic, assign) uint32_t h;
-@property (nonatomic, assign) uint32_t bitrateKbps;
+@property (nonatomic, assign, readwrite) uint32_t bitrateKbps;
 @property (nonatomic, assign) int64_t  frameIndex;
 @property (nonatomic, assign) uint64_t bytesEncoded;
 /* Reusable Annex-B assembly buffer. VideoToolbox delivers output frames
@@ -72,6 +73,8 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
      * desync — that still fired with tiny static-screen frames, so it is not a
      * bandwidth problem. Removed. */
 
+    VTSessionSetProperty(_session, kVTCompressionPropertyKey_ExpectedFrameRate,
+                         (__bridge CFTypeRef)@([ScreenCapture configuredFPS]));
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime,           kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,
@@ -120,6 +123,15 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
                                     frameProps, refcon, NULL);
     if (frameProps) CFRelease(frameProps);
     CVPixelBufferRelease(pixbuf);
+}
+
+- (void)setBitrateKbps:(uint32_t)kbps {
+    if (kbps == _bitrateKbps) return;
+    _bitrateKbps = kbps;
+    if (!_session) return;
+    int32_t bps = (int32_t)(kbps * 1000);
+    VTSessionSetProperty(_session, kVTCompressionPropertyKey_AverageBitRate,
+                         (__bridge CFTypeRef)@(bps));
 }
 
 - (void)forceKeyframe {

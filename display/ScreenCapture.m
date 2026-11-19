@@ -32,6 +32,7 @@
  * heartbeat can re-feed it after SCStream goes idle on a static screen. */
 @property (nonatomic, assign) IOSurfaceRef lastSurface;
 @property (nonatomic, strong) dispatch_source_t heartbeat;
+@property (nonatomic, assign) BOOL refeedPending;
 @property (nonatomic, assign) uint64_t lastHeartbeatFrameCount;
 @end
 
@@ -50,6 +51,29 @@ static char kOnCaptureQueue;
 }
 
 - (BOOL)isCapturing { return _capturing; }
+
++ (uint32_t)configuredFPS {
+    const char *e = getenv("RDP_FPS");
+    int n = e ? atoi(e) : 30;
+    if (n < 5 || n > 60) n = 30;
+    return (uint32_t)n;
+}
+
+- (void)refeedLastFrameAfterMs:(uint32_t)ms {
+    if (_refeedPending) return;       /* only touched on the capture queue */
+    _refeedPending = YES;
+    __weak typeof(self) weak = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * NSEC_PER_MSEC),
+                   _captureQueue, ^{
+        typeof(self) s = weak;
+        if (!s) return;
+        s->_refeedPending = NO;
+        IOSurfaceRef surf = s.lastSurface;
+        ScreenCaptureFrameBlock handler = s.frameHandler;
+        if (s.capturing && surf && handler)
+            handler(surf, s.capW, s.capH, CGRectMake(0, 0, s.capW, s.capH));
+    });
+}
 
 - (void)setLastSurface:(IOSurfaceRef)surface {
     if (_lastSurface == surface) return;
@@ -116,7 +140,7 @@ static char kOnCaptureQueue;
         cfg.width                = width;
         cfg.height               = height;
         cfg.pixelFormat          = kCVPixelFormatType_32BGRA;
-        cfg.minimumFrameInterval = CMTimeMake(1, 30);   /* cap ~30 fps (RDP-sane) */
+        cfg.minimumFrameInterval = CMTimeMake(1, (int32_t)[ScreenCapture configuredFPS]);   /* RDP_FPS, default 30 */
         cfg.queueDepth           = 5;
         /* Show the macOS cursor composited into the capture by default, so the user
          * sees the real Mac pointer (I-beam, resize, beachball, etc.). Configurable

@@ -97,6 +97,7 @@ add_executable(macos-rdp-daemon
     daemon/UpdateVerify.m
     daemon/FileProvider/RDPFileProvider.m
     protocol/RDPPeer.c
+    protocol/RDPFlowControl.c
     protocol/RDPClipboard.c
     protocol/RDPClipboardCodec.c
     protocol/RDPClipboardFiles.c
@@ -113,6 +114,7 @@ add_executable(macos-rdp-daemon
     audio/AudioCapture.m
     audio/AudioInput.m
     audio/AudioRedirect.c
+    audio/ImaAdpcm.c
 )
 
 target_include_directories(macos-rdp-daemon PRIVATE

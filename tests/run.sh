@@ -55,3 +55,11 @@ clang -fobjc-arc -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_update_verify.m
     "$ROOT/daemon/UpdateVerify.m" -framework Foundation -framework Security \
     -o "$OUT/test_update_verify"
 "$OUT/test_update_verify"
+
+clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_flowcontrol.c" \
+    "$ROOT/protocol/RDPFlowControl.c" -o "$OUT/test_flowcontrol"
+"$OUT/test_flowcontrol"
+
+clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_ima.c" \
+    "$ROOT/audio/ImaAdpcm.c" -lm -o "$OUT/test_ima"
+"$OUT/test_ima"

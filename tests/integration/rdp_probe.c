@@ -59,8 +59,19 @@ static UINT w_map(RdpgfxClientContext *c, const RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU
            p->outputOriginY);
     return o_map(c, p);
 }
+/* Slow-client simulation: the client decodes/acks one frame per g_slowMs (the
+ * FrameAcknowledge goes out after this callback returns), and once stalls for
+ * g_stallMs after frame 30 (acks stop completely for that long). */
+static UINT32 g_slowMs, g_stallMs;
 static UINT w_cmd(RdpgfxClientContext *c, const RDPGFX_SURFACE_COMMAND *p) {
     g_cmds++;
+    if (g_stallMs && g_cmds == 30) {
+        printf("  stall: no acks for %u ms\n", g_stallMs);
+        fflush(stdout);
+        Sleep(g_stallMs);
+    } else if (g_slowMs) {
+        Sleep(g_slowMs);
+    }
     return o_cmd(c, p);
 }
 static UINT w_caps(DispClientContext *d, UINT32 maxMon, UINT32 a, UINT32 b) {
@@ -131,6 +142,8 @@ int main(int argc, char **argv) {
     int sep = -1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--expect-monitors") == 0 && i + 1 < argc) expectMonitors = (UINT32)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--slow-ms") == 0 && i + 1 < argc) g_slowMs = (UINT32)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--stall-ms") == 0 && i + 1 < argc) g_stallMs = (UINT32)atoi(argv[++i]);
         else if (strcmp(argv[i], "--") == 0) { sep = i; break; }
     }
     if (sep < 0) { fprintf(stderr, "usage: %s [--expect-monitors N] -- <client args>\n", argv[0]); return 2; }

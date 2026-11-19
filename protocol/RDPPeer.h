@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <pthread.h>
 
+#include "protocol/RDPFlowControl.h"
+#include "audio/ImaAdpcm.h"
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
 #include <freerdp/server/rdpgfx.h>
@@ -120,6 +122,7 @@ struct rdp_peer_context {
     DispServerContext   *disp;
     RdpsndServerContext  *rdpsnd;
     uint32_t             frameId;    /* monotonic GFX frame id for StartFrame/EndFrame */
+    RDPFlowControl       fc;         /* GFX FrameAcknowledge window + adaptive bitrate */
     /* Current layout and one GFX surface per monitor (surfaceCount == 0 until
      * both a layout is set and the client's GFX caps arrived). Frames tagged
      * with an older layoutEpoch are dropped. All guarded by xportLock. */
@@ -157,6 +160,12 @@ struct rdp_peer_context {
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
+    /* Negotiated IMA ADPCM (RDP_AUDIO_CODEC=auto): our own encoder, blocks sent
+     * with SendSamples2. Used only from the audio thread after audioReady. */
+    bool                 imaActive;
+    ImaEncoder           ima;
+    uint8_t             *imaBuf;
+    size_t               imaCap;
     /* Clipboard (MS-RDPECLIP): the whole protocol engine, state and threading rules
      * live in protocol/RDPClipboard.c. Created in peer_post_connect, pumped from
      * rdp_peer_run_once (under xportLock), destroyed in context_free. The host
@@ -256,6 +265,13 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
                                bool isKeyFrame,
                                uint16_t dirtyX, uint16_t dirtyY,
                                uint16_t dirtyW, uint16_t dirtyH);
+
+/* Flow control (see RDPFlowControl.h). can_send is called by capture BEFORE
+ * encoding; false = skip this frame. Safe from any thread, takes no xportLock. */
+bool rdp_peer_gfx_can_send(freerdp_peer *peer);
+/* Rate step, every ~500 ms. Returns the bitrate scale in permille of the target. */
+uint32_t rdp_peer_gfx_rate_step(freerdp_peer *peer, bool *changed,
+                                uint32_t *maxInFlight, double *latencyMs, uint32_t *skips);
 
 bool rdp_peer_send_bitmap(freerdp_peer *peer,
                            const uint8_t *bgra, uint32_t x, uint32_t y,

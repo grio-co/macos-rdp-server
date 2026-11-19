@@ -10,7 +10,7 @@
 #                    (pasteboardWithUniqueName, released globally at the end)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEPS="${RDP_DEPS_DIR:-/Users/grio/macrdp/build/deps}"
+DEPS="${RDP_DEPS_DIR:-$ROOT/build/deps}"
 FI="$DEPS/freerdp-install/include"
 OUT="$ROOT/build/tests"
 mkdir -p "$OUT/tmp"
@@ -38,3 +38,11 @@ perl -e 'alarm 90; exec @ARGV' "$OUT/test_pasteboard"
 # daemon/main.m shutdown pattern (dispatch signal sources + main run loop), isolated.
 clang -fobjc-arc "${WARN[@]}" "$ROOT/tests/test_runloop.m" -framework Foundation -o "$OUT/test_runloop"
 perl -e 'alarm 30; exec @ARGV' "$OUT/test_runloop"
+
+clang -std=c11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_security_core.c" \
+    "$ROOT/daemon/SecurityCore.c" -o "$OUT/test_security_core"
+"$OUT/test_security_core"
+
+clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_input_logic.c" \
+    -o "$OUT/test_input_logic"
+"$OUT/test_input_logic"

@@ -226,13 +226,18 @@ static void peer_apply_settings(freerdp_peer *peer) {
     /* Security. TLS is always offered unless NLA-only is requested; NLA
      * (CredSSP/NTLM) is added when the session layer found NT hashes in the SAM
      * file (WinPR's NTLM server reads FreeRDP_NtlmSamFile; MD4/RC4 come from the
-     * WITH_INTERNAL_MD4/RC4 build). Legacy RDP security stays as the last-resort
-     * fallback except in NLA-only mode. */
+     * WITH_INTERNAL_MD4/RC4 build). Legacy Standard RDP Security (RC4, no server
+     * authentication) is off, as on a current Windows host: offering it lets a
+     * man in the middle strip TLS from the negotiation, and every client since
+     * Windows XP SP3 does TLS. RDP_LEGACY_SECURITY=1 re-enables it (never in
+     * NLA-only mode). */
     const RDPPeerSecurity *sec = &((RDPPeerContext *)peer->context)->callbacks.security;
     bool nla = sec->nlaMode != 0 && sec->samPath && *sec->samPath;
     bool nlaOnly = nla && sec->nlaMode == 2;
     freerdp_settings_set_bool(s,   FreeRDP_UseRdpSecurityLayer,     FALSE);
-    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             nlaOnly ? FALSE : TRUE);
+    const char *legacy = getenv("RDP_LEGACY_SECURITY");
+    bool rdpSec = !nlaOnly && legacy && strcmp(legacy, "1") == 0;
+    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             rdpSec ? TRUE : FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             nlaOnly ? FALSE : TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             nla ? TRUE : FALSE);
     if (nla) freerdp_settings_set_string(s, FreeRDP_NtlmSamFile, sec->samPath);
@@ -257,10 +262,9 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasExtendedMouseEvent,   TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SoundBeepsEnabled,       FALSE);
-    /* Accept multi-monitor connections: client may send monitor layout data
-     * (e.g. "Use all my monitors" in mstsc). We create one virtual display
-     * sized to the combined DesktopWidth × DesktopHeight, which covers both
-     * the span case and the independent-monitor case from the server's side. */
+    /* Multi-monitor ("Use all my monitors" in mstsc): the client's monitor
+     * layout arrives in the MCS data and later over DISP; the session gives each
+     * monitor its own virtual display and GFX surface (see rdp_peer_set_layout). */
     freerdp_settings_set_bool(s,   FreeRDP_UseMultimon,             TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SupportMonitorLayoutPdu, TRUE);
 

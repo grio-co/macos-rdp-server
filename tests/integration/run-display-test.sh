@@ -29,7 +29,8 @@ trap 'kill $DPID 2>/dev/null; wait $DPID 2>/dev/null' EXIT
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; sleep 0.1; done
 
 "$PROBE" --expect-monitors "$EXPECT" -- /v:127.0.0.1:"$PORT" /u:probe /p:probe \
-    /cert:ignore /size:1280x720 -clipboard /audio-mode:2 /gfx:AVC420 /log-level:ERROR
+    /cert:ignore /size:1280x720 -clipboard /audio-mode:2 /gfx:AVC420 /log-level:ERROR \
+    ${RDP_PROBE_ARGS:-}   # extra client options (word-split), e.g. RDP_PROBE_ARGS=/sec:rdp
 RC=$?
 kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
 echo "--- daemon log (display/gfx/disp lines): $LOG"

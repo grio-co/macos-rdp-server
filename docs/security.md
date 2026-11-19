@@ -64,6 +64,7 @@ and lockout rules. Clients that do not request NLA still negotiate TLS.
 | `RDP_ALLOW_NO_AUTH` | unset | `1` skips authentication, **only when bound to loopback**; otherwise logged as an error and ignored. For tests. |
 | `RDP_IDLE_TIMEOUT_MIN` | `0` (off) | Disconnect after this many minutes without keyboard or mouse input. |
 | `RDP_TLS_MIN` | `1.2` | Minimum TLS version for the RDP transport (`1.0`, `1.1`, `1.2`, `1.3`). |
+| `RDP_LEGACY_SECURITY` | unset | `1` also offers legacy Standard RDP Security (RC4, no server authentication) for clients that cannot do TLS. Off by default because offering it lets a man in the middle downgrade any client; never offered with `RDP_NLA=require`. |
 | `RDP_AUDIT_LOG` | `~/Library/Logs/macos-rdp-connections.log` | Audit log path (mainly for tests). |
 
 ## Allowed users

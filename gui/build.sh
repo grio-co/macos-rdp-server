@@ -40,9 +40,11 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/MacOSRDPConfig"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 
-# Ad-hoc sign so it launches without Gatekeeper griping on the dev box.
-codesign --force --sign - "$APP" >/dev/null 2>&1 || \
-    echo "(codesign skipped/failed — app still runs locally)"
+# Sign with the Developer ID certificate: hardened runtime, secure timestamp, no
+# entitlements (the app needs none). Never ad-hoc or any other identity.
+SIGN_ID="Developer ID Application: Grioghar Thomas-Baldwin (FQKL8883DP)"
+codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+codesign --verify --strict --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 
 cat <<EOF
 

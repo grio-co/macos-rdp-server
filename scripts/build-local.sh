@@ -14,6 +14,7 @@
 # Output: build/release/macos-rdp-daemon
 #
 # Environment overrides:
+#   RDP_BUILD_VERSION      release tag to stamp (e.g. v0.1.7); the updater needs a tag
 #   RDP_CODESIGN_IDENTITY  signing identity (default: Developer ID Application, FQKL8883DP)
 #   RDP_DEPS_DIR           FreeRDP build cache (default build/deps; share it across worktrees)
 #   RDP_BUILD_DIR          daemon build dir (default build/release)
@@ -106,7 +107,7 @@ cmake -S "$ROOT" -B "$OUT" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="$ARCHS" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-    -DMACOS_RDP_STATIC=ON \
+    -DMACOS_RDP_STATIC=ON ${RDP_BUILD_VERSION:+-DMACOS_RDP_BUILD_VERSION=$RDP_BUILD_VERSION} \
     -DFREERDP_STATIC_INSTALL="$FREERDP_INSTALL" \
     -DCMAKE_PREFIX_PATH="$FREERDP_INSTALL;$OPENSSL_ROOT" \
     -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE > "$OUT.configure.log"

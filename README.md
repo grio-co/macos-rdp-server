@@ -34,8 +34,17 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 > ```
 >
 > It runs the daemon as a per-user LaunchAgent (Aqua session → WindowServer → capture
-> works) and signs it with a stable self-signed certificate, so macOS pins the permission
-> grant to the signature rather than the cdhash that changes on every rebuild. No sudo.
+> works). The binary must already be Developer ID signed (build it with
+> `scripts/build-local.sh`); the installer verifies that and never re-signs, so macOS pins
+> the permission grant to a stable signature. No sudo.
+>
+> **Auto-update:** the daemon only installs a release asset that is strictly newer (tags such
+> as `v0.1.7`, compared numerically) and signed with the owner's Developer ID (team
+> `FQKL8883DP`, identifier `com.macosrdp.daemon`, hardened runtime). Nothing is re-signed.
+> CI-built release binaries are not Developer ID signed, so the updater rejects them: build
+> release binaries with `RDP_BUILD_VERSION=vX.Y.Z scripts/build-local.sh` and upload them
+> (`macos-rdp-daemon` + `macos-rdp-daemon.sha256`) to the GitHub release yourself.
+> `RDP_UPDATE_ENABLED=0` turns the updater off.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash

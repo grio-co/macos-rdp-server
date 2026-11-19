@@ -18,11 +18,13 @@ NS_ASSUME_NONNULL_BEGIN
  *   RDP_UPDATE_INTERVAL_MIN  Check interval in minutes (default 5).
  *   RDP_UPDATE_REPO          GitHub "owner/repo" (default grioghar/macos-rdp-server).
  *   RDP_UPDATE_TOKEN         Optional Bearer token for a private repo.
- *   RDP_SIGN_KEYCHAIN        Signing keychain path
- *                            (default ~/.macos-rdp/signing/macos-rdp.keychain-db).
- *   RDP_SIGN_KEYCHAIN_PW     Keychain unlock password (default "macosrdp").
- *   RDP_SIGN_IDENTITY        codesign identity SHA-1 / name
- *                            (default 5A4065DBD72516AFC58960B05B2A135B32650D44).
+ *
+ * Updates are never re-signed. A downloaded binary is installed only if it is
+ * strictly newer than the running version (release tags such as v0.1.7,
+ * compared numerically; a running build not stamped with a tag never updates)
+ * and passes SecStaticCodeCheckValidity against: anchor apple generic, leaf OU
+ * FQKL8883DP, identifier com.macosrdp.daemon, hardened runtime. Release
+ * binaries must therefore be built with scripts/build-local.sh.
  */
 @interface AutoUpdate : NSObject
 

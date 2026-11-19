@@ -7,10 +7,10 @@
 #     so it has a WindowServer connection. A system LaunchDaemon does NOT, which is why
 #     the daemon rendered a black screen under the old install.
 #   * macOS TCC pins the Screen-Recording / Accessibility grant to the binary's code
-#     signature. An ad-hoc / linker signature gets a new cdhash on every rebuild, so the
-#     grant breaks each time you update. This script signs the binary with a STABLE
-#     self-signed certificate, so TCC pins to the (identifier + cert) requirement and the
-#     grant SURVIVES rebuilds. Re-running this script to deploy a new build keeps the grant.
+#     signature. The binary must already be signed with the Developer ID certificate
+#     (scripts/build-local.sh does this), so TCC pins to a stable requirement and the
+#     grant SURVIVES rebuilds. This script never signs or re-signs anything; it refuses
+#     a binary that is not Developer ID signed with identifier com.macosrdp.daemon.
 #   * Everything lives under $HOME, so no sudo is ever required.
 #
 # Usage:
@@ -30,15 +30,10 @@ fi
 PORT="${RDP_PORT:-3389}"
 ROOT="$HOME/.macos-rdp"
 BIN_DIR="$ROOT/bin"
-SIGN_DIR="$ROOT/signing"
 BIN="$BIN_DIR/macos-rdp-daemon"
 PLIST="$HOME/Library/LaunchAgents/com.macosrdp.agent.plist"
 LABEL="com.macosrdp.agent"
 GUI="gui/$(id -u)"
-KC="$SIGN_DIR/macos-rdp.keychain-db"
-KCPASS="macosrdp"
-P12PASS="temp12"
-CN="macos-rdp-signing"
 
 # 1. Locate the binary to install ------------------------------------------------------
 SRC="${1:-}"
@@ -53,53 +48,23 @@ if [[ -z "$SRC" ]]; then
 fi
 [[ -f "$SRC" ]] || { echo "Binary not found: $SRC" >&2; exit 1; }
 
-mkdir -p "$BIN_DIR" "$SIGN_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+mkdir -p "$BIN_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 
-# 2. Stable self-signed code-signing cert (created once, reused on every rebuild) -------
-if [[ ! -f "$SIGN_DIR/cert.pem" ]]; then
-    echo "==> Generating stable self-signed code-signing certificate..."
-    cat > "$SIGN_DIR/openssl.cnf" <<'CNF'
-[req]
-distinguished_name = dn
-x509_extensions    = v3
-prompt             = no
-[dn]
-CN = macos-rdp-signing
-[v3]
-basicConstraints   = critical,CA:false
-keyUsage           = critical,digitalSignature
-extendedKeyUsage   = critical,codeSigning
-CNF
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -keyout "$SIGN_DIR/key.pem" -out "$SIGN_DIR/cert.pem" \
-        -config "$SIGN_DIR/openssl.cnf"
-    openssl pkcs12 -export -name "$CN" \
-        -inkey "$SIGN_DIR/key.pem" -in "$SIGN_DIR/cert.pem" \
-        -out "$SIGN_DIR/cert.p12" -passout "pass:$P12PASS"
+# 2. Verify the signature (never re-sign) ---------------------------------------------
+REQ='anchor apple generic and certificate leaf[subject.OU] = "FQKL8883DP" and identifier "com.macosrdp.daemon"'
+if ! codesign --verify --strict -R="$REQ" "$SRC" 2>/dev/null; then
+    echo "Refusing to install: $SRC is not signed with the Developer ID certificate" >&2
+    echo "(team FQKL8883DP, identifier com.macosrdp.daemon). Build it with scripts/build-local.sh." >&2
+    exit 1
 fi
 
-# 3. Keychain holding the signing identity (idempotent, unlocked, no auto-lock) ---------
-security delete-keychain "$KC" 2>/dev/null || true
-security create-keychain -p "$KCPASS" "$KC"
-security set-keychain-settings "$KC"
-security unlock-keychain -p "$KCPASS" "$KC"
-security list-keychains -d user -s "$KC" "$HOME/Library/Keychains/login.keychain-db"
-security import "$SIGN_DIR/cert.p12" -k "$KC" -P "$P12PASS" -T /usr/bin/codesign -A
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null 2>&1 || true
-
-HASH="$(security find-certificate -c "$CN" -Z "$KC" | awk '/SHA-1/{print $3; exit}')"
-[[ -n "$HASH" ]] || { echo "Could not determine signing cert hash" >&2; exit 1; }
-
-# 4. Install + sign the binary (stable DR -> TCC grant survives rebuilds) ---------------
-echo "==> Installing and signing binary..."
+# 3. Install ---------------------------------------------------------------------------
+echo "==> Installing binary..."
 cp "$SRC" "$BIN"
 chmod 755 "$BIN"
-# The cert is untrusted for Gatekeeper, but TCC matches the Designated Requirement (not
-# Gatekeeper trust) and launchd runs it regardless, so this is all we need.
-codesign --keychain "$KC" -s "$HASH" --identifier macos-rdp-daemon --force "$BIN"
 codesign -d -r- "$BIN" 2>&1 | grep -i "designated" || true
 
-# 5. RDP TLS certificate (self-signed) into the user cert dir ---------------------------
+# 4. RDP TLS certificate (self-signed) into the user cert dir ---------------------------
 if [[ ! -f "$ROOT/server.crt" || ! -f "$ROOT/server.key" ]]; then
     echo "==> Generating RDP TLS certificate..."
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -108,7 +73,7 @@ if [[ ! -f "$ROOT/server.crt" || ! -f "$ROOT/server.key" ]]; then
     chmod 600 "$ROOT/server.key"
 fi
 
-# 6. Per-user LaunchAgent (Aqua session => WindowServer => capture works) ---------------
+# 5. Per-user LaunchAgent (Aqua session => WindowServer => capture works) ---------------
 echo "==> Writing LaunchAgent..."
 cat > "$PLIST" <<PL
 <?xml version="1.0" encoding="UTF-8"?>

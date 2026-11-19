@@ -118,7 +118,6 @@ static uint32_t bitrate_for(uint32_t w, uint32_t h) {
         .onMouse     = rdp_on_mouse,
         .onMouseEx   = rdp_on_mouse_ex,
         .onSynchronize = rdp_on_synchronize,
-        .onClipboard = rdp_on_clipboard,
         .onReady     = rdp_on_ready,
         .onKeyframeRequest = rdp_on_keyframe_request,
         .userdata    = (__bridge void *)self,
@@ -266,13 +265,6 @@ static void rdp_on_synchronize(void *ud, uint32_t flags) {
     [self.injector synchronizeLockKeys:flags];
 }
 
-static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
-                              uint32_t format) {
-    RDPSession *self = (__bridge RDPSession *)ud;
-    rdp_verbose("clipboard from client: format=0x%08x len=%zu", format, len);
-    [self.clipboard receiveFromClient:data length:len format:format];
-}
-
 /* Runs with xportLock held, on the run loop or an encoder thread: only flags. */
 static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     RDPSession *self = (__bridge RDPSession *)ud;
@@ -374,12 +366,14 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     [_displayControl start];
 
     __weak typeof(self) weak = self;
-    _clipboard = [[ClipboardSync alloc] init];
-    _clipboard.sendToClientBlock = ^(const uint8_t *data, size_t len, uint32_t fmt) {
-        rdp_verbose("sending clipboard to client: format=0x%08x len=%zu", fmt, len);
-        rdp_peer_send_clipboard(weak.peer, data, len, fmt);
-    };
-    [_clipboard start];
+    /* Clipboard: the protocol engine lives in the peer; ClipboardSync is the
+     * NSPasteboard side. No clipboard channel (client without cliprdr) -> none. */
+    RDPClipboard *clip = rdp_peer_get_clipboard(_peer);
+    if (clip) {
+        _clipboard = [[ClipboardSync alloc] initWithClipboard:clip];
+        rdp_clip_release(clip);      /* ClipboardSync holds its own reference */
+        [_clipboard start];
+    }
 
     /* Only start audio capture if the client actually declared audio support.
        Saves a CoreAudio IO proc registration for clients that don't want audio. */

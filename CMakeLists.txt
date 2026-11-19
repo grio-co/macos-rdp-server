@@ -96,6 +96,10 @@ add_executable(macos-rdp-daemon
     daemon/AutoUpdate.m
     daemon/FileProvider/RDPFileProvider.m
     protocol/RDPPeer.c
+    protocol/RDPClipboard.c
+    protocol/RDPClipboardCodec.c
+    protocol/RDPClipboardFiles.c
+    protocol/RDPClipboardImage.c
     protocol/RDPWebDAV.c
     protocol/RDPDriveMount.m
     display/VirtualDisplay.m
@@ -133,6 +137,7 @@ target_link_libraries(macos-rdp-daemon PRIVATE
     "-framework AudioToolbox"
     "-framework AppKit"
     "-framework ApplicationServices"
+    "-framework ImageIO"
     "-framework OpenDirectory"
     "-framework IOKit"
     "-framework IOSurface"

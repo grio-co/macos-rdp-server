@@ -4,7 +4,6 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <syslog.h>
 #import <signal.h>
-#import <sys/event.h>
 #import <unistd.h>
 #import "daemon/RDPServer.h"
 #import "daemon/RDPSession.h"
@@ -99,23 +98,42 @@ int main(int argc, char *argv[]) {
                  MACOS_RDP_VERSION, MACOS_RDP_BUILD_VERSION,
                  (const char *[]){"error","info","verbose","debug"}[rdp_log_get_level()]);
 
-        /* Block SIGTERM/SIGINT at the signal level; catch via kqueue instead.
-           This gives us a clean shutdown path with zero polling overhead. */
+        /* SIGTERM/SIGINT keep SIG_IGN as their default disposition and are caught by
+         * dispatch signal sources instead (kqueue underneath: zero polling). The
+         * sources fire on their OWN serial queue, never the main thread: the main
+         * thread now runs the main run loop (below) and may be parked inside an
+         * NSPasteboard data-provider callback waiting for the RDP client, so
+         * shutdown must not depend on it. */
         signal(SIGPIPE, SIG_IGN);
-        sigset_t mask;
-        sigemptyset(&mask);
-        sigaddset(&mask, SIGTERM);
-        sigaddset(&mask, SIGINT);
-        sigprocmask(SIG_BLOCK, &mask, NULL);
+        signal(SIGTERM, SIG_IGN);
+        signal(SIGINT,  SIG_IGN);
 
-        int kq = kqueue();
-        struct kevent kev[2];
-        EV_SET(&kev[0], SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
-        EV_SET(&kev[1], SIGINT,  EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
-        kevent(kq, kev, 2, NULL, 0, NULL);
+        __block RDPServer *server = nil;
+        __block IOPMAssertionID daemonWakeAssertion = kIOPMNullAssertionID;
+        __block BOOL shuttingDown = NO;
+        dispatch_queue_t signalQueue = dispatch_queue_create("com.macosrdp.signals", DISPATCH_QUEUE_SERIAL);
+        void (^onSignal)(void) = ^{
+            if (shuttingDown) return;
+            shuttingDown = YES;
+            rdp_info("shutting down");
+            if (daemonWakeAssertion != kIOPMNullAssertionID)
+                IOPMAssertionRelease(daemonWakeAssertion);
+            [server stop];
+            closelog();
+            /* Let the main thread fall out of its run loop and return from main(); if
+             * it is stuck (e.g. blocked in a paste) force the exit. */
+            CFRunLoopStop(CFRunLoopGetMain());
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), signalQueue, ^{ exit(0); });
+        };
+        dispatch_source_t termSrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, signalQueue);
+        dispatch_source_t intSrc  = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT,  0, signalQueue);
+        dispatch_source_set_event_handler(termSrc, onSignal);
+        dispatch_source_set_event_handler(intSrc,  onSignal);
+        dispatch_resume(termSrc);
+        dispatch_resume(intSrc);
 
         AppDelegate *delegate = [[AppDelegate alloc] init];
-        RDPServer *server = [[RDPServer alloc] initWithPort:port];
+        server = [[RDPServer alloc] initWithPort:port];
         server.delegate = delegate;
 
         NSError *error = nil;
@@ -133,7 +151,6 @@ int main(int argc, char *argv[]) {
          * are still held in DisplayControl for the duration of each session.
          * RDP_ALLOW_IDLE_SLEEP=1 disables this for setups where battery life
          * matters more than always-on reachability. */
-        IOPMAssertionID daemonWakeAssertion = kIOPMNullAssertionID;
         const char *allowSleep = getenv("RDP_ALLOW_IDLE_SLEEP");
         if (!(allowSleep && strcmp(allowSleep, "1") == 0)) {
             IOReturn ar = IOPMAssertionCreateWithName(
@@ -151,27 +168,23 @@ int main(int argc, char *argv[]) {
 
         /* Start the silent self-updater (no-op if RDP_UPDATE_ENABLED=0). It
          * runs entirely on its own background serial queue + dispatch timer —
-         * it never touches the main thread (which is about to park in kevent). */
+         * it never touches the main thread (which is about to run the main run loop). */
         [AutoUpdate start];
 
-        /* Spin the run loop on a background thread so CFRunLoop/dispatch works,
-           while this thread blocks on kqueue — zero CPU until a signal arrives. */
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            [[NSRunLoop currentRunLoop] run];
-        });
+        /* Run the MAIN run loop on the main thread. NSPasteboard data providers (the
+         * clipboard's delayed rendering of Windows files/images/HTML) and the main
+         * dispatch queue are only serviced here. A long-period no-op timer
+         * guarantees the loop always has a source, so CFRunLoopRun() parks until
+         * the signal handler calls CFRunLoopStop() instead of returning at once. */
+        CFRunLoopTimerRef keepAlive = CFRunLoopTimerCreateWithHandler(
+            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 3600.0, 3600.0, 0, 0,
+            ^(CFRunLoopTimerRef t) { (void)t; });
+        CFRunLoopAddTimer(CFRunLoopGetMain(), keepAlive, kCFRunLoopCommonModes);
+        CFRunLoopRun();
+        CFRunLoopRemoveTimer(CFRunLoopGetMain(), keepAlive, kCFRunLoopCommonModes);
+        CFRelease(keepAlive);
+        (void)termSrc; (void)intSrc;
 
-        struct kevent got;
-        while (1) {
-            int n = kevent(kq, NULL, 0, &got, 1, NULL); /* blocks until signal */
-            if (n > 0 && (got.ident == SIGTERM || got.ident == SIGINT)) break;
-        }
-        close(kq);
-
-        rdp_info("shutting down");
-        if (daemonWakeAssertion != kIOPMNullAssertionID)
-            IOPMAssertionRelease(daemonWakeAssertion);
-        [server stop];
-        closelog();
         return 0;
     }
 }

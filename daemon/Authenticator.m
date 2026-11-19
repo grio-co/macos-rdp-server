@@ -1,14 +1,17 @@
 #import "daemon/Authenticator.h"
 #import <OpenDirectory/OpenDirectory.h>
+#import "daemon/SecurityPolicy.h"
 #import <Foundation/Foundation.h>
+#include <pwd.h>
 #define RDP_LOG_COMPONENT "auth"
 #include "logging/RDPLog.h"
 
 @implementation Authenticator
 
 + (BOOL)authenticationDisabled {
-    const char *env = getenv("RDP_ALLOW_NO_AUTH");
-    return (env && strcmp(env, "1") == 0);
+    /* RDP_ALLOW_NO_AUTH=1 only takes effect when the daemon is bound to a
+     * loopback address (decided once at server start by SecurityPolicy). */
+    return [SecurityPolicy noAuthEffective];
 }
 
 /* Primary path: ask OpenDirectory for the user's record on the local node and
@@ -92,10 +95,15 @@
                 password:(NSString *)password
                   domain:(NSString *)domain {
     if ([self authenticationDisabled]) {
-        rdp_info("auth: RDP_ALLOW_NO_AUTH=1 — skipping credential check");
+        rdp_info("auth: RDP_ALLOW_NO_AUTH=1 (loopback only) — skipping credential check");
         return YES;
     }
+    return [self strictValidateUsername:username password:password domain:domain];
+}
 
++ (BOOL)strictValidateUsername:(NSString *)username
+                      password:(NSString *)password
+                        domain:(NSString *)domain {
     if (username.length == 0 || password.length == 0) {
         rdp_info("auth: missing %s — rejecting (fail-closed)",
                  username.length == 0 ? "username" : "password");
@@ -120,6 +128,44 @@
     rdp_info("auth: final result for '%s' -> %s",
              username.UTF8String, ok ? "GRANTED" : "DENIED");
     return ok;
+}
+
++ (NSDictionary *)accountInfoForName:(NSString *)name {
+    if (name.length == 0) return nil;
+    @autoreleasepool {
+        NSError *err = nil;
+        ODSession *session = [ODSession defaultSession];
+        ODNode *node = session ? [ODNode nodeWithSession:session
+                                                    name:@"/Local/Default"
+                                                   error:&err] : nil;
+        if (node) {
+            ODRecord *rec = [node recordWithRecordType:kODRecordTypeUsers
+                                                  name:name
+                                            attributes:nil
+                                                 error:&err];
+            if (!rec) return nil;   /* OD reachable, no such user */
+            NSMutableArray *names = [NSMutableArray array];
+            NSArray *rn = [rec valuesForAttribute:kODAttributeTypeRecordName error:nil];
+            for (id v in rn) if ([v isKindOfClass:NSString.class]) [names addObject:v];
+            NSArray *fn = [rec valuesForAttribute:kODAttributeTypeFullName error:nil];
+            for (id v in fn)
+                if ([v isKindOfClass:NSString.class] && ![names containsObject:v])
+                    [names addObject:v];
+            NSString *shortName = rec.recordName ?: names.firstObject ?: name;
+            if (![names containsObject:shortName]) [names insertObject:shortName atIndex:0];
+            long uid = -1;
+            NSArray *uv = [rec valuesForAttribute:kODAttributeTypeUniqueID error:nil];
+            id u0 = uv.firstObject;
+            if ([u0 isKindOfClass:NSString.class]) uid = [u0 longLongValue];
+            else if ([u0 isKindOfClass:NSNumber.class]) uid = [u0 longValue];
+            return @{@"short": shortName, @"names": names, @"uid": @(uid)};
+        }
+    }
+    /* OpenDirectory unreachable: fall back to the libc passwd lookup. */
+    struct passwd *pw = getpwnam(name.UTF8String);
+    if (!pw) return nil;
+    NSString *sn = [NSString stringWithUTF8String:pw->pw_name];
+    return @{@"short": sn, @"names": @[sn], @"uid": @((long)pw->pw_uid)};
 }
 
 @end

@@ -55,6 +55,26 @@ bool rdp_layout_equal(const RDPMonitorLayout *a, const RDPMonitorLayout *b);
 /* Keyboard lock-key sync; flags use KBD_SYNC_* bits (caps 0x4). */
 typedef void (*RDPPeerSyncCallback)(void *userdata, uint32_t flags);
 
+/* Called from FreeRDP's Logon hook right after security negotiation. `nla` is
+ * true when CredSSP completed, in which case user/domain/password are the
+ * cleartext credentials the client delegated (FreeRDP stores them in the
+ * settings, which the later Client Info PDU overwrites, so they are only valid
+ * here). `selectedProtocol` is the negotiated PROTOCOL_* mask. The pointers are
+ * owned by FreeRDP and must be copied, never retained or logged. Return false to
+ * reject the client; the session then tears the connection down. */
+typedef bool (*RDPPeerLogonCallback)(void *userdata, bool nla,
+                                     uint32_t selectedProtocol,
+                                     const char *user, const char *domain,
+                                     const char *password);
+
+/* Per-connection transport-security configuration (NLA). `nlaMode`: 0 = TLS
+ * only, 1 = offer NLA and TLS, 2 = NLA only. `samPath` is WinPR's SAM file used
+ * by the NTLM server to look up NT hashes; copied during rdp_peer_create. */
+typedef struct {
+    int         nlaMode;
+    const char *samPath;
+} RDPPeerSecurity;
+
 /* IRP async completion callback type.  Invoked on the peer run-loop thread
  * when a PAKID_CORE_DEVICE_IOCOMPLETION arrives for the matching CompletionId.
  * ioStatus — NT status code (0 = success).
@@ -80,6 +100,8 @@ typedef struct {
      * Called with xportLock held, from the run loop or an encoder thread: it must
      * only set a flag, never block or call back into the peer. */
     RDPPeerKeyframeCallback  onKeyframeRequest;
+    RDPPeerLogonCallback     onLogon;
+    RDPPeerSecurity          security;
     void *userdata;
 } RDPPeerCallbacks;
 

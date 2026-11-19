@@ -223,15 +223,35 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_GfxSmallCache,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_GfxThinClient,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_RemoteFxCodec,           FALSE);
-    /* Security: match the known-good sample-server config. Crucially disable
-     * NLA — it requires NTLM/md4, which our minimal OpenSSL build omits (the
-     * "md4 NTLM support not available" log line). Offer TLS (+ legacy RDP as a
-     * fallback) so mstsc negotiates TLS. */
+    /* Security. TLS is always offered unless NLA-only is requested; NLA
+     * (CredSSP/NTLM) is added when the session layer found NT hashes in the SAM
+     * file (WinPR's NTLM server reads FreeRDP_NtlmSamFile; MD4/RC4 come from the
+     * WITH_INTERNAL_MD4/RC4 build). Legacy RDP security stays as the last-resort
+     * fallback except in NLA-only mode. */
+    const RDPPeerSecurity *sec = &((RDPPeerContext *)peer->context)->callbacks.security;
+    bool nla = sec->nlaMode != 0 && sec->samPath && *sec->samPath;
+    bool nlaOnly = nla && sec->nlaMode == 2;
     freerdp_settings_set_bool(s,   FreeRDP_UseRdpSecurityLayer,     FALSE);
-    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             TRUE);
-    freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             TRUE);
-    freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             nlaOnly ? FALSE : TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             nlaOnly ? FALSE : TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             nla ? TRUE : FALSE);
+    if (nla) freerdp_settings_set_string(s, FreeRDP_NtlmSamFile, sec->samPath);
     freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,             1);
+    /* TLS floor: require TLS >= 1.2 for the RDP transport (FreeRDP 3.10.3 applies
+     * FreeRDP_TLSMinVersion via SSL_CTX_set_min_proto_version in tls_prepare).
+     * RDP_TLS_MIN=1.0|1.1|1.2|1.3 overrides for very old clients. */
+    {
+        uint16_t minTls = 0x0303;                     /* TLS1_2_VERSION */
+        const char *tm = getenv("RDP_TLS_MIN");
+        if (tm && *tm) {
+            if      (!strcmp(tm, "1.0")) minTls = 0x0301;
+            else if (!strcmp(tm, "1.1")) minTls = 0x0302;
+            else if (!strcmp(tm, "1.2")) minTls = 0x0303;
+            else if (!strcmp(tm, "1.3")) minTls = 0x0304;
+            else rdp_error("RDP_TLS_MIN='%s' not recognised (1.0|1.1|1.2|1.3) — using 1.2", tm);
+        }
+        freerdp_settings_set_uint16(s, FreeRDP_TLSMinVersion, minTls);
+    }
     freerdp_settings_set_uint32(s, FreeRDP_ColorDepth,              32);
     freerdp_settings_set_bool(s,   FreeRDP_UnicodeInput,            TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
@@ -1082,6 +1102,33 @@ void rdp_peer_get_credentials(freerdp_peer *peer,
     if (domain)   *domain   = dm;
 }
 
+/* Logon hook (FreeRDP 3.10.3 libfreerdp/core/peer.c, CONNECTION_STATE_NEGO):
+ * invoked once, right after security negotiation. For NLA (`automatic` TRUE)
+ * CredSSP has finished by now and nla.c (nla_read_ts_credentials) has stored the
+ * client's delegated TSPasswordCreds in this peer's settings as FreeRDP_Domain /
+ * FreeRDP_Username / FreeRDP_Password — the SEC_WINNT_AUTH_IDENTITY argument is
+ * NOT filled on the server side. The later Client Info PDU (info.c
+ * rdp_read_info_string) overwrites those settings, so this is the only place the
+ * NLA password can be read. FreeRDP ignores our return value, so a rejection is
+ * enforced by the session layer (the callback marks the session Disconnecting).
+ * NEVER log the password. */
+static BOOL peer_logon(freerdp_peer *peer, const SEC_WINNT_AUTH_IDENTITY *identity,
+                       BOOL automatic) {
+    (void)identity;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    rdpSettings *s = peer->context->settings;
+    uint32_t proto = freerdp_settings_get_uint32(s, FreeRDP_SelectedProtocol);
+    if (!ctx->callbacks.onLogon) return TRUE;
+    const char *user = NULL, *domain = NULL, *pass = NULL;
+    if (automatic) {
+        user   = freerdp_settings_get_string(s, FreeRDP_Username);
+        domain = freerdp_settings_get_string(s, FreeRDP_Domain);
+        pass   = freerdp_settings_get_string(s, FreeRDP_Password);
+    }
+    return ctx->callbacks.onLogon(ctx->callbacks.userdata, automatic ? true : false,
+                                  proto, user, domain, pass) ? TRUE : FALSE;
+}
+
 /* ── Public API ────────────────────────────────────────────────────────── */
 
 /* Register FreeRDP's built-in server WTS implementation exactly once, before
@@ -1125,6 +1172,7 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     peer_apply_settings(peer);
     peer->PostConnect = peer_post_connect;
     peer->Activate    = peer_activate;
+    peer->Logon       = peer_logon;
     /* Handle minimize/restore (Suppress Output) so the window doesn't come back
      * black. SuppressOutput lives on rdpUpdate in 3.x. */
     peer->context->update->SuppressOutput = peer_suppress_output;

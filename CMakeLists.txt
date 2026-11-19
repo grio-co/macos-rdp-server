@@ -90,6 +90,8 @@ add_executable(macos-rdp-daemon
     daemon/RDPServer.m
     daemon/RDPSession.m
     daemon/Authenticator.m
+    daemon/SecurityCore.c
+    daemon/SecurityPolicy.m
     daemon/DisplayControl.m
     daemon/AutoUpdate.m
     daemon/FileProvider/RDPFileProvider.m

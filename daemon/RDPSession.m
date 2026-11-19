@@ -72,6 +72,7 @@ static const uint32_t kDefaultBitrate = 8000;
         .onUnicodeKeyboard = rdp_on_unicode_keyboard,
         .onMouse     = rdp_on_mouse,
         .onMouseEx   = rdp_on_mouse_ex,
+        .onSynchronize = rdp_on_synchronize,
         .onClipboard = rdp_on_clipboard,
         .onReady     = rdp_on_ready,
         .onKeyframeRequest = rdp_on_keyframe_request,
@@ -165,7 +166,13 @@ static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
 static void rdp_on_mouse_ex(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
     rdp_debug("mouse_ex flags=0x%04x x=%u y=%u", flags, x, y);
-    [self.injector injectMouseEvent:flags x:x y:y];
+    [self.injector injectMouseExEvent:flags x:x y:y];
+}
+
+static void rdp_on_synchronize(void *ud, uint32_t flags) {
+    RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_debug("sync flags=0x%x", flags);
+    [self.injector synchronizeLockKeys:flags];
 }
 
 static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
@@ -378,6 +385,7 @@ static void rdp_on_keyframe_request(void *ud) {
 
 - (void)teardown {
     rdp_verbose("tearing down session for %s", _address.UTF8String);
+    [_injector releaseAll];   /* never leave Cmd or a mouse button held */
     [_cursor stop];
     [_capture stop];
     [_encoder stop];

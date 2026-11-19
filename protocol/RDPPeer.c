@@ -269,6 +269,18 @@ static BOOL peer_mouse_ex(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
     return TRUE;
 }
 
+static BOOL peer_synchronize(rdpInput *input, UINT32 flags) {
+    RDPPeerContext *ctx = (RDPPeerContext *)input->context;
+    if (ctx->callbacks.onSynchronize)
+        ctx->callbacks.onSynchronize(ctx->callbacks.userdata, flags);
+    return TRUE;
+}
+
+/* FocusIn toggleStates use the same bit layout as KBD_SYNC_*. */
+static BOOL peer_focus_in(rdpInput *input, UINT16 toggleStates) {
+    return peer_synchronize(input, toggleStates);
+}
+
 /* ── GFX caps negotiation ──────────────────────────────────────────────── */
 
 static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
@@ -972,6 +984,8 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     peer->context->input->UnicodeKeyboardEvent = peer_unicode_keyboard;
     peer->context->input->MouseEvent           = peer_mouse;
     peer->context->input->ExtendedMouseEvent   = peer_mouse_ex;
+    peer->context->input->SynchronizeEvent     = peer_synchronize;
+    peer->context->input->FocusInEvent         = peer_focus_in;
 
     if (!peer->Initialize(peer)) {
         rdp_error("peer Initialize failed (TLS handshake error)");

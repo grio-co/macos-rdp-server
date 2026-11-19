@@ -21,6 +21,8 @@ typedef void (*RDPPeerMouseCallback)(void *userdata, uint16_t flags, uint16_t x,
 typedef void (*RDPPeerClipboardCallback)(void *userdata, const uint8_t *data, size_t len, uint32_t format);
 typedef void (*RDPPeerReadyCallback)(void *userdata, uint32_t width, uint32_t height, uint32_t colorDepth);
 typedef void (*RDPPeerKeyframeCallback)(void *userdata);
+/* Keyboard lock-key sync; flags use KBD_SYNC_* bits (caps 0x4). */
+typedef void (*RDPPeerSyncCallback)(void *userdata, uint32_t flags);
 
 /* IRP async completion callback type.  Invoked on the peer run-loop thread
  * when a PAKID_CORE_DEVICE_IOCOMPLETION arrives for the matching CompletionId.
@@ -38,6 +40,7 @@ typedef struct {
     RDPPeerInputCallback     onUnicodeKeyboard;
     RDPPeerMouseCallback     onMouse;
     RDPPeerMouseCallback     onMouseEx;
+    RDPPeerSyncCallback      onSynchronize;
     RDPPeerClipboardCallback onClipboard;
     RDPPeerReadyCallback     onReady;
     /* Asks the encoder to emit an IDR keyframe ASAP. Invoked when the GFX channel

@@ -51,6 +51,11 @@ NS_ASSUME_NONNULL_BEGIN
  * called. */
 - (void)stop;
 
+/* Call once at daemon start. While a panel is dimmed, its original brightness is
+ * kept in ~/.macos-rdp/dimmed-brightness.plist; if an earlier run died before
+ * restoring it, this puts it back so the Mac's own screen isn't left dark. */
++ (void)restoreBrightnessLeftDimmed;
+
 @end
 
 NS_ASSUME_NONNULL_END

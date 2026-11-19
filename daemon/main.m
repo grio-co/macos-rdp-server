@@ -10,6 +10,7 @@
 #import "daemon/RDPSession.h"
 #import "daemon/AutoUpdate.h"
 #import "daemon/SecurityPolicy.h"
+#import "daemon/DisplayControl.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
 
@@ -145,6 +146,10 @@ int main(int argc, char *argv[]) {
         dispatch_source_set_event_handler(intSrc,  onSignal);
         dispatch_resume(termSrc);
         dispatch_resume(intSrc);
+
+        /* An earlier run that died mid-session may have left the built-in panel
+         * dimmed to black; put its brightness back before serving anyone. */
+        [DisplayControl restoreBrightnessLeftDimmed];
 
         AppDelegate *delegate = [[AppDelegate alloc] init];
         server = [[RDPServer alloc] initWithPort:port];

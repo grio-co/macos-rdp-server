@@ -100,8 +100,11 @@ static const uint32_t kVendorID = 0x5244500u;   /* "RDP" */
     CGRect b = CGDisplayBounds(_did);
     _ptsW = (uint32_t)b.size.width; _ptsH = (uint32_t)b.size.height;
     _retina = NO;
-    rdp_error("virtual display unavailable — capturing the main display %u "
-              "(letterboxed, single monitor)", _did);
+    if (vdEnv && strcmp(vdEnv, "0") == 0)
+        rdp_verbose("RDP_VIRTUAL_DISPLAY=0: serving the main display %u", _did);
+    else
+        rdp_error("virtual display unavailable — capturing the main display %u "
+                  "(letterboxed, single monitor)", _did);
     return _did != 0;
 }
 

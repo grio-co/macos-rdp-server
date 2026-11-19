@@ -22,7 +22,7 @@ VD=0; EXPECT=1
 
 env RDP_CERT_DIR="${RDP_CERT_DIR:-$HOME/.macos-rdp}" RDP_ALLOW_NO_AUTH=1 RDP_NLA=off RDP_VIRTUAL_DISPLAY=$VD RDP_SHARED_MODE=1 \
     RDP_NO_TCC_PROMPT=1 RDP_CURSOR_SHAPES=0 RDP_UPDATE_ENABLED=0 \
-    "$BIN" --port "$PORT" --bind 127.0.0.1 --log-level verbose >"$LOG" 2>&1 &
+    "$BIN" --port "$PORT" --bind 127.0.0.1 --log-level "${RDP_TEST_LOG_LEVEL:-verbose}" >"$LOG" 2>&1 &
 DPID=$!
 trap 'kill $DPID 2>/dev/null; wait $DPID 2>/dev/null' EXIT
 

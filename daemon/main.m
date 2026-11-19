@@ -1,3 +1,4 @@
+#import "display/VirtualDisplay.h"
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -60,6 +61,19 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         openlog("macos-rdp-daemon", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+
+        /* Helper mode, spawned by VirtualDisplay: select one display's mode, exit. */
+        if (argc >= 6 && strcmp(argv[1], "--set-display-mode") == 0)
+            return [VirtualDisplay runSetModeHelperWithArgc:argc - 2 argv:argv + 2];
+
+        /* Connect to the window server and register for display changes on the
+         * MAIN thread, before any other thread touches CoreGraphics. CG delivers
+         * display notifications — which are also what keeps this process's view
+         * of display geometry current — on the run loop of the thread that
+         * connected first. Session threads never run theirs, so without this no
+         * notification ever arrived and CGDisplayBounds lagged virtual-display
+         * changes until the next display-configuration call. */
+        [VirtualDisplay prepareOnMainThread];
 
         /* A LaunchDaemon starts with no HOME. WinPR's WTSOpenServer (used to
          * create the virtual-channel manager) resolves paths under HOME, so a

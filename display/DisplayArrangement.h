@@ -28,8 +28,11 @@ NS_ASSUME_NONNULL_BEGIN
 /* Snapshots the current origin of every active display. */
 - (instancetype)init;
 
-/* displayIDs[i] serves layout->monitors[i]. */
+/* displayIDs[i] serves layout->monitors[i]; pointSizes[i] is its desktop size
+ * in points (what was configured — not read back, so a just-changed mode
+ * cannot be mistaken for the old one). */
 - (void)arrangeDisplays:(NSArray<NSNumber *> *)displayIDs
+             pointSizes:(const CGSize *)pointSizes
                  layout:(const RDPMonitorLayout *)layout;
 
 /* Call after the virtual displays were destroyed. Waits (bounded) for them to

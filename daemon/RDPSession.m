@@ -483,8 +483,12 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     }
 
     NSMutableArray<NSNumber *> *ids = [NSMutableArray array];
-    for (VirtualDisplay *vd in displays) [ids addObject:@(vd.displayID)];
-    if (allVirtual) [_arrangement arrangeDisplays:ids layout:&layout];
+    CGSize pointSizes[RDP_MAX_MONITORS];
+    for (VirtualDisplay *vd in displays) {
+        pointSizes[ids.count] = CGSizeMake(vd.pointsWide, vd.pointsHigh);
+        [ids addObject:@(vd.displayID)];
+    }
+    if (allVirtual) [_arrangement arrangeDisplays:ids pointSizes:pointSizes layout:&layout];
 
     /* Client side: ResetGraphics + one surface per monitor. Frames must carry the
      * returned epoch; anything encoded for the previous layout is dropped. */

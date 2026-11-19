@@ -36,6 +36,7 @@ static BOOL contains_id(NSArray<NSNumber *> *ids, CGDirectDisplayID did) {
 static BOOL near(int32_t a, int32_t b) { return a - b <= 2 && b - a <= 2; }
 
 - (void)arrangeDisplays:(NSArray<NSNumber *> *)displayIDs
+             pointSizes:(const CGSize *)pointSizes
                  layout:(const RDPMonitorLayout *)layout {
     uint32_t n = MIN((uint32_t)displayIDs.count, layout->count);
     if (n == 0) return;
@@ -44,7 +45,7 @@ static BOOL near(int32_t a, int32_t b) { return a - b <= 2 && b - a <= 2; }
     CGSize pts[RDP_MAX_MONITORS];
     double f[RDP_MAX_MONITORS];
     for (uint32_t i = 0; i < n; i++) {
-        pts[i] = CGDisplayBounds(displayIDs[i].unsignedIntValue).size;
+        pts[i] = pointSizes[i];
         f[i] = layout->monitors[i].width ? pts[i].width / layout->monitors[i].width : 1.0;
     }
 

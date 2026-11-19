@@ -44,6 +44,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)destroy;
 
+/* Call once on the main thread, before any other thread uses CoreGraphics (the
+ * main run loop must be run afterwards): opens this process's window-server
+ * connection there, so display notifications are serviced (see main.m). */
++ (void)prepareOnMainThread;
+
+/* Entry point of the `--set-display-mode` helper process (see VirtualDisplay.m). */
++ (int)runSetModeHelperWithArgc:(int)argc argv:(char *_Nonnull *_Nonnull)argv;
+
 /* The points size a client monitor gets: honours RDP_HIDPI=0 (always 1:1) and
  * RDP_SCALE=<percent> (override the client's scale), and never shrinks the Mac
  * desktop below 800x600 points. Pure; exposed for logging and tests. */

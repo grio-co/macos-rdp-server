@@ -1,8 +1,10 @@
 #import "daemon/RDPSession.h"
 #import "daemon/DisplayControl.h"
 #import "daemon/Authenticator.h"
+#import "daemon/SecurityPolicy.h"
 #import "protocol/RDPPeer.h"
 #import "display/VirtualDisplay.h"
+#import "display/DisplayArrangement.h"
 #import "display/ScreenCapture.h"
 #import "display/FrameEncoder.h"
 #import "display/CursorCapture.h"
@@ -10,24 +12,47 @@
 #import "input/ClipboardSync.h"
 #import "audio/AudioCapture.h"
 #import "audio/AudioRedirect.h"
+#import <os/lock.h>
 #import <unistd.h>
 #include <freerdp/freerdp.h>
 #define RDP_LOG_COMPONENT "session"
 #include "logging/RDPLog.h"
 
-static const uint32_t kDefaultWidth   = 1920;
-static const uint32_t kDefaultHeight  = 1080;
-static const uint32_t kDefaultBitrate = 8000;
+/* H.264 bitrate for a 1080p monitor; other sizes scale with their area. */
+static const uint32_t kBitrate1080pKbps = 8000;
+/* A window drag sends a burst of layout requests; act once they settle. */
+static const uint32_t kLayoutDebounceMs = 350;
 
-@interface RDPSession ()
+static uint32_t bitrate_for(uint32_t w, uint32_t h) {
+    double kbps = kBitrate1080pKbps * ((double)w * h) / (1920.0 * 1080.0);
+    return (uint32_t)MIN(MAX(kbps, 3000.0), 25000.0);
+}
+
+/* One client monitor: the Mac display serving it, its capture and its encoder. */
+@interface RDPMonitorPipeline : NSObject
+@property (nonatomic, strong) VirtualDisplay *display;
+@property (nonatomic, strong) ScreenCapture  *capture;
+@property (nonatomic, strong) FrameEncoder   *encoder;
+@end
+@implementation RDPMonitorPipeline
+@end
+
+@interface RDPSession () {
+    /* Guards _pipelines for the keyframe callback, which runs on encoder and
+     * run-loop threads; the session queue is the only writer. */
+    os_unfair_lock _pipeLock;
+    NSArray<RDPMonitorPipeline *> *_pipelines;
+    RDPMonitorLayout _layout;          /* what the client is being served */
+    dispatch_source_t _rateTimer;      /* adaptive bitrate tick */
+    dispatch_queue_t  _rateQueue;
+    uint32_t _rateScale;               /* permille of bitrate_for(); session queue */
+}
 @property (nonatomic, assign) int fd;
 @property (nonatomic, assign) RDPSessionState sessionState;
 @property (nonatomic, strong) NSString *address;
 @property (nonatomic, assign) freerdp_peer *peer;
-@property (nonatomic, strong) VirtualDisplay  *display;
+@property (nonatomic, strong) DisplayArrangement *arrangement;
 @property (nonatomic, strong) DisplayControl  *displayControl;
-@property (nonatomic, strong) ScreenCapture   *capture;
-@property (nonatomic, strong) FrameEncoder    *encoder;
 @property (nonatomic, strong) InputInjector   *injector;
 @property (nonatomic, strong) ClipboardSync   *clipboard;
 @property (nonatomic, strong) AudioCapture    *audio;
@@ -40,6 +65,9 @@ static const uint32_t kDefaultBitrate = 8000;
  * skip re-authenticating / re-activating on a subsequent Activate (mstsc may
  * re-activate on a resize). Guarded by the serial session queue. */
 @property (nonatomic, assign) BOOL activated;
+/* Per-connection security state: negotiated protocol, auth result, lockout /
+ * idle bookkeeping, audit trail (daemon/SecurityPolicy.m). */
+@property (nonatomic, strong) SecurityConnection *sec;
 @end
 
 @implementation RDPSession
@@ -52,8 +80,26 @@ static const uint32_t kDefaultBitrate = 8000;
         _sessionQueue   = dispatch_queue_create("com.macosrdp.session",
                                                 DISPATCH_QUEUE_SERIAL);
         _teardownSem    = dispatch_semaphore_create(0);
+        _pipeLock       = OS_UNFAIR_LOCK_INIT;
+        _pipelines      = @[];
     }
     return self;
+}
+
+- (NSArray<RDPMonitorPipeline *> *)pipelineSnapshot {
+    os_unfair_lock_lock(&_pipeLock);
+    NSArray<RDPMonitorPipeline *> *p = _pipelines;
+    os_unfair_lock_unlock(&_pipeLock);
+    return p;
+}
+
+- (void)publishPipelines:(NSArray<RDPMonitorPipeline *> *)pipelines {
+    NSArray<RDPMonitorPipeline *> *copy = [pipelines copy], *old;
+    os_unfair_lock_lock(&_pipeLock);
+    old = _pipelines;
+    _pipelines = copy;
+    os_unfair_lock_unlock(&_pipeLock);
+    (void)old;   /* the previous pipelines are released at scope exit, unlocked */
 }
 
 - (int)clientFd             { return _fd; }
@@ -67,15 +113,24 @@ static const uint32_t kDefaultBitrate = 8000;
 
 - (void)setupAndRun {
     rdp_verbose("creating RDP peer for fd=%d", _fd);
+    _sec = [[SecurityConnection alloc] initWithAddress:_address];
     RDPPeerCallbacks cb = {
+        .onLogon     = rdp_on_logon,
         .onKeyboard  = rdp_on_keyboard,
+        .onUnicodeKeyboard = rdp_on_unicode_keyboard,
         .onMouse     = rdp_on_mouse,
         .onMouseEx   = rdp_on_mouse_ex,
-        .onClipboard = rdp_on_clipboard,
+        .onSynchronize = rdp_on_synchronize,
         .onReady     = rdp_on_ready,
         .onKeyframeRequest = rdp_on_keyframe_request,
         .userdata    = (__bridge void *)self,
     };
+
+    int nlaMode = 0;
+    NSString *samPath = nil;
+    [_sec getNlaMode:&nlaMode samPath:&samPath];   /* NLA offer (auto/require/off) */
+    cb.security.nlaMode = nlaMode;
+    cb.security.samPath = samPath.UTF8String;
 
     _peer = rdp_peer_create(_fd, &cb);
     if (!_peer) {
@@ -107,7 +162,24 @@ static const uint32_t kDefaultBitrate = 8000;
             [[NSDate date] compare:negoDeadline] == NSOrderedDescending) {
             rdp_info("negotiation timeout (%gs) for %s — dropping stale connection",
                      kNegotiationTimeoutSecs, _address.UTF8String);
+            _sec.endReason = @"negotiation timeout";
             break;
+        }
+        /* Idle timeout (RDP_IDLE_TIMEOUT_MIN): no keyboard/mouse input for too long. */
+        if (_sessionState == RDPSessionStateActive && [_sec idleTimeoutExceeded]) {
+            rdp_info("idle timeout (%d min without input) — disconnecting %s",
+                     (int)([SecurityPolicy idleTimeoutSeconds] / 60), _address.UTF8String);
+            _sec.endReason = @"idle timeout";
+            break;
+        }
+        /* The client resized its window or changed monitors (MS-RDPEDISP). */
+        if (_sessionState == RDPSessionStateActive) {
+            RDPMonitorLayout req;
+            if (rdp_peer_take_pending_layout(_peer, &req, kLayoutDebounceMs)) {
+                rdp_info("client requested a new layout: %u monitor(s), desktop %ux%u",
+                         req.count, req.desktopWidth, req.desktopHeight);
+                [self applyLayout:&req];
+            }
         }
         /* rdpsnd format negotiation completes asynchronously (Activated callback)
          * AFTER audio capture starts. The client plays our PCM at the rate IT
@@ -126,7 +198,26 @@ static const uint32_t kDefaultBitrate = 8000;
         }
     }
 
+    uint32_t selProto = _peer ? freerdp_settings_get_uint32(_peer->context->settings,
+                                                            FreeRDP_SelectedProtocol) : 0;
+    [_sec finishWithSelectedProtocol:selProto
+                         serverEnded:(_sessionState == RDPSessionStateDisconnecting)];
     [self teardown];
+}
+
+/* FreeRDP Logon hook → SecurityConnection (negotiated protocol; for NLA also the
+ * CredSSP-delegated credentials). A rejection marks the session Disconnecting so
+ * the peer loop exits before the MCS/capability exchange proceeds. */
+static bool rdp_on_logon(void *ud, bool nla, uint32_t proto, const char *user,
+                         const char *domain, const char *password) {
+    RDPSession *self = (__bridge RDPSession *)ud;
+    BOOL ok = [self.sec handleLogonNla:nla ? YES : NO
+                      selectedProtocol:proto
+                                  user:user ? [NSString stringWithUTF8String:user] : nil
+                                domain:domain ? [NSString stringWithUTF8String:domain] : nil
+                              password:password ? [NSString stringWithUTF8String:password] : nil];
+    if (!ok) self->_sessionState = RDPSessionStateDisconnecting;
+    return ok;
 }
 
 static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
@@ -137,17 +228,26 @@ static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
      * this behind the blocking loop — it would only run after the loop exits and
      * teardown has freed _peer (use-after-free crash), and media would never be
      * set up during a live session. Run it inline: the peer is alive here. */
-    [self setupDisplayAndMediaForWidth:w height:h];
+    [self activateSession];
 }
 
 static void rdp_on_keyboard(void *ud, uint16_t flags, uint16_t code) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("key flags=0x%04x code=0x%02x", flags, code);
     [self.injector injectKeyEvent:flags scanCode:code];
 }
 
+static void rdp_on_unicode_keyboard(void *ud, uint16_t flags, uint16_t code) {
+    RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
+    rdp_debug("unicode key flags=0x%04x code=U+%04X", flags, code);
+    [self.injector injectUnicodeKeyEvent:flags code:code];
+}
+
 static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("mouse flags=0x%04x x=%u y=%u", flags, x, y);
     if (flags & (RDP_PTR_WHEEL | RDP_PTR_HWHEEL))
         [self.injector injectMouseWheelEvent:flags x:x y:y];
@@ -157,24 +257,30 @@ static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
 
 static void rdp_on_mouse_ex(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    [self.sec noteInput];
     rdp_debug("mouse_ex flags=0x%04x x=%u y=%u", flags, x, y);
-    [self.injector injectMouseEvent:flags x:x y:y];
+    [self.injector injectMouseExEvent:flags x:x y:y];
 }
 
-static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
-                              uint32_t format) {
+static void rdp_on_synchronize(void *ud, uint32_t flags) {
     RDPSession *self = (__bridge RDPSession *)ud;
-    rdp_verbose("clipboard from client: format=0x%08x len=%zu", format, len);
-    [self.clipboard receiveFromClient:data length:len format:format];
+    rdp_debug("sync flags=0x%x", flags);
+    [self.injector synchronizeLockKeys:flags];
 }
 
-static void rdp_on_keyframe_request(void *ud) {
+/* Runs with xportLock held, on the run loop or an encoder thread: only flags. */
+static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     RDPSession *self = (__bridge RDPSession *)ud;
-    rdp_debug("keyframe requested by peer");
-    [self.encoder forceKeyframe];
+    NSArray<RDPMonitorPipeline *> *pipes = [self pipelineSnapshot];
+    rdp_debug("keyframe requested for monitor %d", monitorIndex);
+    if (monitorIndex < 0) {
+        for (RDPMonitorPipeline *p in pipes) [p.encoder forceKeyframe];
+    } else if ((NSUInteger)monitorIndex < pipes.count) {
+        [pipes[(NSUInteger)monitorIndex].encoder forceKeyframe];
+    }
 }
 
-- (void)setupDisplayAndMediaForWidth:(uint32_t)w height:(uint32_t)h {
+- (void)activateSession {
     /* mstsc can re-activate (e.g. on a client-side resize). We only authenticate
      * and bring the display up once — re-entry after we're active is a no-op. */
     if (_activated || _sessionState == RDPSessionStateActive) {
@@ -182,7 +288,14 @@ static void rdp_on_keyframe_request(void *ud) {
                     _address.UTF8String);
         return;
     }
+    if (![self authenticateClient]) return;
+    if (![self claimActiveSession]) return;
+    [self startMedia];
+}
 
+/* Validate the client's credentials. Returns NO (and marks the session
+ * Disconnecting) when the client must be rejected. */
+- (BOOL)authenticateClient {
     /* ── Authenticate BEFORE creating any virtual display ─────────────────────
      * Credentials arrived in the RDP logon (peer_activate captured them). Validate
      * against the local macOS account. Fail-closed: bad/missing creds → tear the
@@ -194,15 +307,24 @@ static void rdp_on_keyframe_request(void *ud) {
     NSString *pass   = cpass   ? [NSString stringWithUTF8String:cpass]   : nil;
     NSString *domain = cdomain ? [NSString stringWithUTF8String:cdomain] : nil;
 
-    if (![Authenticator validateUsername:user password:pass domain:domain]) {
+    /* NLA connections were already verified in the Logon hook (CredSSP delivered
+     * the cleartext password; it was re-checked against OpenDirectory there), so
+     * the Client Info PDU carries nothing to prompt for. TLS connections are
+     * verified here, with lockout, allowed-user and audit handling inside
+     * SecurityConnection. */
+    if (![_sec authenticateWithUser:user password:pass domain:domain]) {
         rdp_error("authentication FAILED for %s (user='%s') — rejecting connection",
                   _address.UTF8String, user.length ? user.UTF8String : "(none)");
         _sessionState = RDPSessionStateDisconnecting;
-        return;  /* peer loop sees Disconnecting and exits → teardown, no display */
+        return NO;  /* peer loop sees Disconnecting and exits → teardown, no display */
     }
-    rdp_info("authentication OK for %s (user='%s')",
-             _address.UTF8String, user.length ? user.UTF8String : "(none)");
+    [_sec markActive];
+    return YES;
+}
 
+/* Become the single active session, superseding any other. Returns NO (and
+ * marks the session Disconnecting) if activation was refused. */
+- (BOOL)claimActiveSession {
     /* ── Become the single active session (takeover) ──────────────────────────
      * Ask the server to make us active. It signals any currently-active session
      * to disconnect and BLOCKS here until that old session has released its
@@ -213,73 +335,48 @@ static void rdp_on_keyframe_request(void *ud) {
         if (![self.delegate sessionDidAuthenticateAndRequestActivation:self]) {
             rdp_info("activation refused for %s — aborting session", _address.UTF8String);
             _sessionState = RDPSessionStateDisconnecting;
-            return;
+            return NO;
         }
     }
     _activated = YES;
+    return YES;
+}
 
-    uint32_t width  = w  ?: kDefaultWidth;
-    uint32_t height = h ?: kDefaultHeight;
+/* Bring up the displays, capture, encoders, input, clipboard, audio and cursor
+ * streaming for an authenticated, active session. */
+- (void)startMedia {
+    RDPMonitorLayout layout;
+    rdp_peer_get_client_layout(_peer, &layout);
+    rdp_info("client layout: %u monitor(s), desktop %ux%u, for %s", layout.count,
+             layout.desktopWidth, layout.desktopHeight, _address.UTF8String);
 
-    rdp_info("setting up display %ux%u for %s", width, height, _address.UTF8String);
-
-    _display = [[VirtualDisplay alloc] initWithWidth:width height:height];
-    if (![_display create]) {
-        rdp_verbose("VirtualDisplay unavailable, falling back to main display");
-        _display = nil;
-    } else {
-        rdp_verbose("VirtualDisplay created: displayID=%u", _display.displayID);
+    _arrangement = [[DisplayArrangement alloc] init];   /* remembers physical displays */
+    _injector = [[InputInjector alloc] initWithDisplayID:CGMainDisplayID()
+                                             sourceWidth:layout.desktopWidth
+                                            sourceHeight:layout.desktopHeight];
+    if (![self applyLayout:&layout]) {
+        rdp_error("no display could be set up for %s — disconnecting", _address.UTF8String);
+        _sessionState = RDPSessionStateDisconnecting;
+        return;
     }
-
-    CGDirectDisplayID displayID = _display ? _display.displayID : CGMainDisplayID();
 
     /* Wake the Mac + keep it awake for the whole session (replaces caffeinate),
      * and privacy-dim the BUILT-IN panel (brightness -> 0) so a bystander can't
-     * watch the remote session. Pass the virtual display id so we never dim the
-     * screen the remote actually captures. RDP_SHARED_MODE=1 skips dimming. */
-    _displayControl = [[DisplayControl alloc] initWithVirtualDisplayID:displayID];
+     * watch the remote session. The session's virtual displays are never dimmed.
+     * RDP_SHARED_MODE=1 skips dimming. */
+    _displayControl = [[DisplayControl alloc]
+        initWithVirtualDisplayID:[self primaryDisplayID]];
     [_displayControl start];
 
-    _encoder = [[FrameEncoder alloc] initWithWidth:width height:height
-                                           bitrate:kDefaultBitrate];
     __weak typeof(self) weak = self;
-    _encoder.outputHandler = ^(const uint8_t *data, size_t len, BOOL keyFrame,
-                               uint16_t dx, uint16_t dy, uint16_t dw, uint16_t dh) {
-        rdp_debug("encoded frame: len=%zu keyFrame=%d dirty=(%u,%u,%ux%u)",
-                  len, keyFrame, dx, dy, dw, dh);
-        rdp_peer_send_h264_frame(weak.peer, data, len, width, height,
-                                 keyFrame ? true : false, dx, dy, dw, dh);
-    };
-    [_encoder start];
-    rdp_verbose("H.264 encoder started at %u kbps", kDefaultBitrate);
-
-    _capture = [[ScreenCapture alloc] initWithDisplayID:displayID];
-    _capture.frameHandler = ^(IOSurfaceRef surface, uint32_t fw, uint32_t fh,
-                               CGRect dirty) {
-        (void)fw; (void)fh;
-        /* Clamp the dirty origin/size to UINT16 surface-pixel coordinates. */
-        uint16_t dx = (uint16_t)MAX(0.0, dirty.origin.x);
-        uint16_t dy = (uint16_t)MAX(0.0, dirty.origin.y);
-        uint16_t dw = (uint16_t)MIN((double)width,  dirty.size.width);
-        uint16_t dh = (uint16_t)MIN((double)height, dirty.size.height);
-        rdp_debug("captured frame: dirty=(%u,%u,%ux%u)", dx, dy, dw, dh);
-        [weak.encoder encodeFrame:surface dirtyX:dx dirtyY:dy dirtyW:dw dirtyH:dh];
-    };
-    if ([_capture startWithWidth:width height:height])
-        rdp_verbose("screen capture started on displayID=%u", displayID);
-    else
-        rdp_error("screen capture FAILED on displayID=%u — desktop will be black "
-                  "until Screen Recording is granted", displayID);
-
-    _injector  = [[InputInjector alloc] initWithDisplayID:displayID
-                                              sourceWidth:width
-                                             sourceHeight:height];
-    _clipboard = [[ClipboardSync alloc] init];
-    _clipboard.sendToClientBlock = ^(const uint8_t *data, size_t len, uint32_t fmt) {
-        rdp_verbose("sending clipboard to client: format=0x%08x len=%zu", fmt, len);
-        rdp_peer_send_clipboard(weak.peer, data, len, fmt);
-    };
-    [_clipboard start];
+    /* Clipboard: the protocol engine lives in the peer; ClipboardSync is the
+     * NSPasteboard side. No clipboard channel (client without cliprdr) -> none. */
+    RDPClipboard *clip = rdp_peer_get_clipboard(_peer);
+    if (clip) {
+        _clipboard = [[ClipboardSync alloc] initWithClipboard:clip];
+        rdp_clip_release(clip);      /* ClipboardSync holds its own reference */
+        [_clipboard start];
+    }
 
     /* Only start audio capture if the client actually declared audio support.
        Saves a CoreAudio IO proc registration for clients that don't want audio. */
@@ -312,25 +409,168 @@ static void rdp_on_keyframe_request(void *ud) {
     rdp_peer_send_default_cursor(_peer);
 
     /* Stream the REAL Mac cursor shapes (I-beam, resize, hand, …) as RDP
-     * color-pointer PDUs. OPT-IN via RDP_CURSOR_SHAPES=1 (default OFF): the
-     * current 32bpp color-pointer renders INVISIBLE on mstsc (shapes are captured
-     * and sent at correct sizes, but the client draws nothing — a 32bpp-alpha
-     * color-pointer quirk under investigation). Default keeps the client-side
-     * SYSPTR_DEFAULT arrow above, which is always visible. Re-enable once the
-     * pointer encoding is fixed (likely switch to 24bpp XOR + 1bpp AND mask). */
+     * color-pointer PDUs. Default ON; opt OUT with RDP_CURSOR_SHAPES=0, which
+     * falls back to the client-side SYSPTR_DEFAULT arrow advertised above.
+     *
+     * This was default-off while the pointer was encoded 32bpp/alpha, which
+     * mstsc renders invisible. rdp_peer_send_cursor_shape now emits a 24bpp BGR
+     * XOR + 1bpp AND mask, which mstsc renders reliably, so the gate no longer
+     * has anything to protect against. */
     const char *curShapes = getenv("RDP_CURSOR_SHAPES");
-    if (curShapes && strcmp(curShapes, "1") == 0) {
+    if (!curShapes || strcmp(curShapes, "0") != 0) {
         _cursor = [[CursorCapture alloc] init];
         _cursor.handler = ^(const uint8_t *bgra, uint32_t cw, uint32_t ch,
                             uint16_t hotX, uint16_t hotY) {
             rdp_peer_send_cursor_shape(weak.peer, bgra, cw, ch, hotX, hotY);
         };
         [_cursor start];
-        rdp_info("cursor-shape streaming ON (RDP_CURSOR_SHAPES=1)");
+        rdp_info("cursor-shape streaming ON (default) — real Mac cursor shapes, "
+                 "24bpp; set RDP_CURSOR_SHAPES=0 to fall back to the system arrow");
     } else {
-        rdp_info("cursor-shape streaming OFF (default) — client draws the system "
-                 "arrow; set RDP_CURSOR_SHAPES=1 to stream real Mac cursor shapes");
+        rdp_info("cursor-shape streaming OFF (RDP_CURSOR_SHAPES=0) — client draws "
+                 "the system arrow");
     }
+}
+
+- (CGDirectDisplayID)primaryDisplayID {
+    NSArray<RDPMonitorPipeline *> *pipes = [self pipelineSnapshot];
+    for (NSUInteger i = 0; i < pipes.count && i < _layout.count; i++)
+        if (_layout.monitors[i].primary) return pipes[i].display.displayID;
+    return pipes.firstObject ? pipes.firstObject.display.displayID : CGMainDisplayID();
+}
+
+/* Serves `requested` to the client: one Mac display per monitor (resized in
+ * place where possible), arranged like the client's monitors, then ResetGraphics
+ * + new surfaces on the client, then fresh capture + encoder per monitor.
+ * Session queue only. Returns NO if no display at all could be provided. */
+- (BOOL)applyLayout:(const RDPMonitorLayout *)requested {
+    RDPMonitorLayout layout = *requested;
+    if (!rdp_layout_normalize(&layout)) return NO;
+    NSArray<RDPMonitorPipeline *> *old = [self pipelineSnapshot];
+
+    /* Quiesce: no new frames, then flush the encoders (their last frames still
+     * belong to the current surfaces, which exist until rdp_peer_set_layout). */
+    for (RDPMonitorPipeline *p in old) [p.capture stop];
+    for (RDPMonitorPipeline *p in old) [p.encoder stop];
+
+    NSMutableArray<VirtualDisplay *> *displays = [NSMutableArray array];
+    BOOL allVirtual = YES;
+    for (uint32_t i = 0; i < layout.count; i++) {
+        const RDPMonitor *m = &layout.monitors[i];
+        VirtualDisplay *vd = i < old.count ? old[i].display
+                                           : [[VirtualDisplay alloc] initWithSerial:i + 1];
+        [vd configureWidth:m->width height:m->height scalePercent:m->scale
+           physicalWidthMm:m->physicalWidthMm physicalHeightMm:m->physicalHeightMm];
+        [displays addObject:vd];
+        if (!vd.isVirtual) { allVirtual = NO; break; }
+    }
+    for (NSUInteger i = layout.count; i < old.count; i++) [old[i].display destroy];
+
+    if (!allVirtual) {
+        /* No virtual displays on this Mac: serve the client's primary monitor
+         * only, from the main display (letterboxed). */
+        for (VirtualDisplay *vd in displays) [vd destroy];
+        RDPMonitor primary = layout.monitors[0];
+        for (uint32_t i = 0; i < layout.count; i++)
+            if (layout.monitors[i].primary) primary = layout.monitors[i];
+        primary.x = primary.y = 0;
+        layout.count = 1;
+        layout.monitors[0] = primary;
+        rdp_layout_normalize(&layout);
+        VirtualDisplay *fallback = displays.firstObject ?: [[VirtualDisplay alloc] initWithSerial:1];
+        if (![fallback configureWidth:primary.width height:primary.height scalePercent:100
+                      physicalWidthMm:0 physicalHeightMm:0])
+            return NO;
+        displays = [NSMutableArray arrayWithObject:fallback];
+        allVirtual = fallback.isVirtual;
+    }
+
+    NSMutableArray<NSNumber *> *ids = [NSMutableArray array];
+    CGSize pointSizes[RDP_MAX_MONITORS];
+    for (VirtualDisplay *vd in displays) {
+        pointSizes[ids.count] = CGSizeMake(vd.pointsWide, vd.pointsHigh);
+        [ids addObject:@(vd.displayID)];
+    }
+    if (allVirtual) [_arrangement arrangeDisplays:ids pointSizes:pointSizes layout:&layout];
+
+    /* Client side: ResetGraphics + one surface per monitor. Frames must carry the
+     * returned epoch; anything encoded for the previous layout is dropped. */
+    uint32_t epoch = rdp_peer_set_layout(_peer, &layout);
+    _layout = layout;
+
+    __weak typeof(self) weak = self;
+    NSMutableArray<RDPMonitorPipeline *> *pipes = [NSMutableArray array];
+    for (uint32_t i = 0; i < layout.count; i++) {
+        const RDPMonitor *m = &layout.monitors[i];
+        uint32_t fw = m->width, fh = m->height, idx = i;
+        RDPMonitorPipeline *p = [RDPMonitorPipeline new];
+        p.display = displays[i];
+
+        p.encoder = [[FrameEncoder alloc] initWithWidth:fw height:fh
+                                                bitrate:bitrate_for(fw, fh) * (_rateScale ?: 1000) / 1000];
+        p.encoder.outputHandler = ^(const uint8_t *data, size_t len, BOOL keyFrame,
+                                    uint16_t dx, uint16_t dy, uint16_t dw, uint16_t dh) {
+            freerdp_peer *peer = weak.peer;
+            if (peer)
+                rdp_peer_send_h264_frame(peer, epoch, idx, data, len, fw, fh,
+                                         keyFrame ? true : false, dx, dy, dw, dh);
+        };
+        [p.encoder start];
+
+        p.capture = [[ScreenCapture alloc] initWithDisplayID:p.display.displayID];
+        __weak FrameEncoder *wenc = p.encoder;
+        __weak ScreenCapture *wcap = p.capture;
+        __block BOOL owesFullFrame = NO;   /* capture queue only */
+        p.capture.frameHandler = ^(IOSurfaceRef surface, uint32_t cw, uint32_t ch,
+                                   CGRect dirty) {
+            (void)cw; (void)ch;
+            /* Flow control BEFORE encoding: a frame already encoded is never
+             * dropped (it would break the H.264 reference chain). The client
+             * paints only a frame's region rects, so a skipped frame's changes
+             * are owed: the next frame sent covers the whole surface. */
+            freerdp_peer *fp = weak.peer;
+            if (fp && !rdp_peer_gfx_can_send(fp)) {
+                owesFullFrame = YES;
+                [wcap refeedLastFrameAfterMs:33];
+                return;
+            }
+            if (owesFullFrame) {
+                owesFullFrame = NO;
+                dirty = CGRectMake(0, 0, fw, fh);
+            }
+            uint16_t dx = (uint16_t)MAX(0.0, dirty.origin.x);
+            uint16_t dy = (uint16_t)MAX(0.0, dirty.origin.y);
+            uint16_t dw = (uint16_t)MIN((double)fw, dirty.size.width);
+            uint16_t dh = (uint16_t)MIN((double)fh, dirty.size.height);
+            [wenc encodeFrame:surface dirtyX:dx dirtyY:dy dirtyW:dw dirtyH:dh];
+        };
+        if (![p.capture startWithWidth:fw height:fh])
+            rdp_error("screen capture FAILED on display %u — monitor %u will be black "
+                      "until Screen Recording is granted", p.display.displayID, i);
+        [pipes addObject:p];
+        rdp_info("monitor %u: %ux%u px at (%d,%d), %u kbps, display %u (%ux%u pt%s)%s",
+                 i, fw, fh, m->x, m->y, bitrate_for(fw, fh), p.display.displayID,
+                 p.display.pointsWide, p.display.pointsHigh,
+                 p.display.hiDPI ? " HiDPI" : "", m->primary ? " primary" : "");
+    }
+    [self publishPipelines:pipes];
+    [self startRateTimer];
+
+    if (allVirtual) {
+        CGRect rects[RDP_MAX_MONITORS];
+        CGDirectDisplayID dids[RDP_MAX_MONITORS];
+        for (uint32_t i = 0; i < layout.count; i++) {
+            const RDPMonitor *m = &layout.monitors[i];
+            rects[i] = CGRectMake(m->x, m->y, m->width, m->height);
+            dids[i]  = displays[i].displayID;
+        }
+        [_injector setMonitorRects:rects displays:dids count:layout.count];
+    } else {
+        [_injector setSingleDisplay:displays[0].displayID
+                        sourceWidth:layout.desktopWidth
+                       sourceHeight:layout.desktopHeight];
+    }
+    return YES;
 }
 
 - (void)disconnect {
@@ -350,15 +590,62 @@ static void rdp_on_keyframe_request(void *ud) {
     return rc == 0;
 }
 
+/* Adaptive bitrate: every 500 ms look at the GFX ack pressure and move the encoders'
+ * average bitrate between 15% and 100% of bitrate_for(). */
+- (void)startRateTimer {
+    if (_rateTimer) return;
+    if (!_rateScale) _rateScale = 1000;
+    /* Not the session queue: the peer loop occupies it for the whole session. */
+    _rateQueue = dispatch_queue_create("com.macosrdp.rate", DISPATCH_QUEUE_SERIAL);
+    _rateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _rateQueue);
+    dispatch_source_set_timer(_rateTimer, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                              500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    __weak typeof(self) weak = self;
+    dispatch_source_set_event_handler(_rateTimer, ^{
+        typeof(self) s = weak;
+        if (!s || !s->_peer) return;
+        bool changed = false; uint32_t maxIf = 0, skips = 0; double lat = 0;
+        uint32_t scale = rdp_peer_gfx_rate_step(s->_peer, &changed, &maxIf, &lat, &skips);
+        if (skips > 0 || maxIf > 3)
+            rdp_verbose("flow: peak in-flight %u, %u capture(s) skipped, ack latency %.0f ms",
+                        maxIf, skips, lat);
+        if (!changed) return;
+        s->_rateScale = scale;
+        for (RDPMonitorPipeline *p in [s pipelineSnapshot]) {
+            uint32_t target = bitrate_for(p.encoder.width, p.encoder.height);
+            uint32_t kbps = MAX(target * scale / 1000, 300u);
+            uint32_t old = p.encoder.bitrateKbps;
+            [p.encoder setBitrateKbps:kbps];
+            rdp_verbose("adaptive bitrate: %u -> %u kbps (target %u, scale %u/1000, "
+                        "ack latency %.0f ms, peak in-flight %u)",
+                        old, kbps, target, scale, lat, maxIf);
+        }
+    });
+    dispatch_resume(_rateTimer);
+}
+
 - (void)teardown {
+    if (_rateTimer) {
+        dispatch_source_cancel(_rateTimer);
+        dispatch_sync(_rateQueue, ^{});   /* a running tick finishes before the peer goes */
+        _rateTimer = nil;
+    }
     rdp_verbose("tearing down session for %s", _address.UTF8String);
+    [_injector releaseAll];   /* never leave Cmd or a mouse button held */
     [_cursor stop];
-    [_capture stop];
-    [_encoder stop];
+    NSArray<RDPMonitorPipeline *> *pipes = [self pipelineSnapshot];
+    for (RDPMonitorPipeline *p in pipes) [p.capture stop];
+    for (RDPMonitorPipeline *p in pipes) [p.encoder stop];
     [_audio stop];
     [_clipboard stop];
     [_displayControl stop];
-    [_display destroy];
+    NSMutableArray<NSNumber *> *virtualIDs = [NSMutableArray array];
+    for (RDPMonitorPipeline *p in pipes) {
+        if (p.display.isVirtual) [virtualIDs addObject:@(p.display.displayID)];
+        [p.display destroy];
+    }
+    [self publishPipelines:@[]];
+    [_arrangement restoreAfterRemoving:virtualIDs];
 
     if (_peer) { rdp_peer_destroy(_peer); _peer = NULL; }
     if (_fd >= 0) { close(_fd); _fd = -1; }

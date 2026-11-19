@@ -5,6 +5,10 @@ name: Build and Release
 # universal in one cmake pass — no build matrix, no per-arch runners, no lipo of
 # the final binary. Everything builds from our forks.
 
+# NOTE: binaries built here are NOT Developer-ID signed (no signing secrets in
+# CI), so the daemon's auto-updater rejects them. Release binaries must be built
+# with scripts/build-local.sh (RDP_BUILD_VERSION=vX.Y.Z) and uploaded by the owner.
+
 on:
   push:
     tags:
@@ -21,7 +25,7 @@ permissions:
 jobs:
   build-and-release:
     name: Build universal binary and release
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -89,7 +93,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.ver.outputs.freerdp }}-universal-${{ steps.ver.outputs.openssl }}-v1
+          key: freerdp-${{ steps.ver.outputs.freerdp }}-universal-${{ steps.ver.outputs.openssl }}-v2-parity
 
       - name: Build universal FreeRDP from fork
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
@@ -115,9 +119,13 @@ jobs:
             -DWITH_WAYLAND=OFF -DWITH_X11=OFF -DWITH_CUPS=OFF -DWITH_PCSC=OFF \
             -DWITH_JPEG=OFF -DWITH_WEBP=OFF -DWITH_OSS=OFF -DWITH_ALSA=OFF -DWITH_PULSE=OFF \
             -DWITH_CHANNELS=ON -DWITH_RDPSND=ON -DWITH_CLIPRDR=ON -DWITH_RDPGFX=ON \
-            -DWITH_RDPEI=OFF -DWITH_RDPDR=OFF -DWITH_PRINTER=OFF -DWITH_SMARTCARD=OFF \
+            -DWITH_RDPEI=OFF -DWITH_RDPDR=ON -DWITH_SERVER_CHANNELS=ON -DWITH_PRINTER=OFF -DWITH_SMARTCARD=OFF \
             -DWITH_SERIAL=OFF -DWITH_PARALLEL=OFF -DWITH_URBDRC=OFF \
-            -DWITH_VIDEO_ENCODER=OFF -DWITH_NEON=OFF -DBUILD_TESTING=OFF \
+            -DWITH_VIDEO_ENCODER=OFF -DWITH_NEON=OFF -DBUILD_TESTING=OFF -DWITH_MANPAGES=OFF \
+            -DWITH_FAAD2=OFF -DWITH_FAAC=OFF -DWITH_SOXR=OFF -DWITH_LAME=OFF -DWITH_GSM=OFF \
+            -DWITH_JSON_DISABLED=ON -DWITH_KRB5=OFF \
+            -DWITH_INTERNAL_MD4=ON -DWITH_INTERNAL_RC4=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build "$SRC/build" --parallel "$(sysctl -n hw.logicalcpu)"
           cmake --install "$SRC/build"

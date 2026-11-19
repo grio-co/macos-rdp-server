@@ -1,4 +1,5 @@
 #import "display/FrameEncoder.h"
+#import "display/ScreenCapture.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <IOSurface/IOSurface.h>
@@ -9,7 +10,7 @@
 @property (nonatomic, assign) VTCompressionSessionRef session;
 @property (nonatomic, assign) uint32_t w;
 @property (nonatomic, assign) uint32_t h;
-@property (nonatomic, assign) uint32_t bitrateKbps;
+@property (nonatomic, assign, readwrite) uint32_t bitrateKbps;
 @property (nonatomic, assign) int64_t  frameIndex;
 @property (nonatomic, assign) uint64_t bytesEncoded;
 /* Reusable Annex-B assembly buffer. VideoToolbox delivers output frames
@@ -17,6 +18,9 @@
  * avoids a heap allocation + grow on every frame (60/sec). */
 @property (nonatomic, strong) NSMutableData *annexBuffer;
 @property (nonatomic, assign) BOOL forceNextKeyframe;
+/* A frame was dropped or failed inside VideoToolbox: its changes never reached
+ * the client, so the next frame out covers the whole surface. VT output thread. */
+@property (atomic, assign) BOOL owesFullFrame;
 @end
 
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
@@ -72,6 +76,8 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
      * desync — that still fired with tiny static-screen frames, so it is not a
      * bandwidth problem. Removed. */
 
+    VTSessionSetProperty(_session, kVTCompressionPropertyKey_ExpectedFrameRate,
+                         (__bridge CFTypeRef)@([ScreenCapture configuredFPS]));
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime,           kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,
@@ -122,6 +128,15 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
     CVPixelBufferRelease(pixbuf);
 }
 
+- (void)setBitrateKbps:(uint32_t)kbps {
+    if (kbps == _bitrateKbps) return;
+    _bitrateKbps = kbps;
+    if (!_session) return;
+    int32_t bps = (int32_t)(kbps * 1000);
+    VTSessionSetProperty(_session, kVTCompressionPropertyKey_AverageBitRate,
+                         (__bridge CFTypeRef)@(bps));
+}
+
 - (void)forceKeyframe {
     _forceNextKeyframe = YES;
 }
@@ -138,9 +153,13 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
 
 - (void)handleSampleBuffer:(CMSampleBufferRef)buf
                   dirtyRect:(void *)refcon {
-    if (!CMSampleBufferDataIsReady(buf)) return;
+    if (!CMSampleBufferDataIsReady(buf)) { self.owesFullFrame = YES; return; }
     uint16_t dx, dy, dw, dh;
     unpack_rect(refcon, &dx, &dy, &dw, &dh);
+    if (self.owesFullFrame) {          /* 0x0 = whole surface (rdp_peer_send_h264_frame) */
+        self.owesFullFrame = NO;
+        dx = dy = dw = dh = 0;
+    }
 
     BOOL isKey = NO;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, FALSE);
@@ -198,12 +217,16 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
                          OSStatus status, VTEncodeInfoFlags infoFlags,
                          CMSampleBufferRef sampleBuffer) {
-    (void)infoFlags;
+    FrameEncoder *enc = (__bridge FrameEncoder *)outputCallbackRefCon;
     if (status != noErr) {
         rdp_error("VT encode callback error: %d", (int)status);
+        enc.owesFullFrame = YES;
         return;
     }
-    if (!sampleBuffer) return;
+    if (!sampleBuffer || (infoFlags & kVTEncodeInfo_FrameDropped)) {
+        enc.owesFullFrame = YES;
+        return;
+    }
     [(__bridge FrameEncoder *)outputCallbackRefCon handleSampleBuffer:sampleBuffer
                                                             dirtyRect:sourceFrameRefCon];
 }

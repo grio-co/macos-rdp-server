@@ -69,9 +69,18 @@ else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FREERDP REQUIRED freerdp3)
     pkg_check_modules(WINPR   REQUIRED winpr3)
+    # The server-side channel implementations (rdpgfx/cliprdr/rdpsnd server
+    # contexts) live in libfreerdp-server3, which freerdp3.pc does NOT pull in.
+    # Without it the link fails with undefined _rdpgfx_server_context_new etc.
+    pkg_check_modules(FREERDP_SERVER REQUIRED freerdp-server3)
     set(FREERDP_INCLUDE "${FREERDP_INCLUDE_DIRS}")
     set(WINPR_INCLUDE   "${WINPR_INCLUDE_DIRS}")
-    set(FREERDP_LINK_LIBS ${FREERDP_LIBRARIES} ${WINPR_LIBRARIES})
+    set(FREERDP_LINK_LIBS ${FREERDP_SERVER_LIBRARIES} ${FREERDP_LIBRARIES} ${WINPR_LIBRARIES})
+    # pkg_check_modules puts the bare library names in *_LIBRARIES but the -L
+    # search path in *_LIBRARY_DIRS. Homebrew installs FreeRDP under a keg that
+    # is NOT on Apple clang's default linker search path, so without applying the
+    # library dirs the link fails with "library 'freerdp3' not found". Apply them.
+    set(FREERDP_LINK_DIRS ${FREERDP_SERVER_LIBRARY_DIRS} ${FREERDP_LIBRARY_DIRS} ${WINPR_LIBRARY_DIRS})
 endif()
 
 # ── Target ────────────────────────────────────────────────────────────────
@@ -81,13 +90,22 @@ add_executable(macos-rdp-daemon
     daemon/RDPServer.m
     daemon/RDPSession.m
     daemon/Authenticator.m
+    daemon/SecurityCore.c
+    daemon/SecurityPolicy.m
     daemon/DisplayControl.m
     daemon/AutoUpdate.m
+    daemon/UpdateVerify.m
     daemon/FileProvider/RDPFileProvider.m
     protocol/RDPPeer.c
+    protocol/RDPFlowControl.c
+    protocol/RDPClipboard.c
+    protocol/RDPClipboardCodec.c
+    protocol/RDPClipboardFiles.c
+    protocol/RDPClipboardImage.c
     protocol/RDPWebDAV.c
     protocol/RDPDriveMount.m
     display/VirtualDisplay.m
+    display/DisplayArrangement.m
     display/ScreenCapture.m
     display/FrameEncoder.m
     display/CursorCapture.m
@@ -96,6 +114,7 @@ add_executable(macos-rdp-daemon
     audio/AudioCapture.m
     audio/AudioInput.m
     audio/AudioRedirect.c
+    audio/ImaAdpcm.c
 )
 
 target_include_directories(macos-rdp-daemon PRIVATE
@@ -105,6 +124,9 @@ target_include_directories(macos-rdp-daemon PRIVATE
     # Static build: FreeRDP installs headers under include/freerdp3 and include/winpr3
     $<$<BOOL:${MACOS_RDP_STATIC}>:${FREERDP_STATIC_INSTALL}/include>
 )
+
+# Apply the pkg-config -L search paths (dynamic build only; empty for static).
+target_link_directories(macos-rdp-daemon PRIVATE ${FREERDP_LINK_DIRS})
 
 target_link_libraries(macos-rdp-daemon PRIVATE
     ${FREERDP_LINK_LIBS}
@@ -118,6 +140,7 @@ target_link_libraries(macos-rdp-daemon PRIVATE
     "-framework AudioToolbox"
     "-framework AppKit"
     "-framework ApplicationServices"
+    "-framework ImageIO"
     "-framework OpenDirectory"
     "-framework IOKit"
     "-framework IOSurface"
@@ -147,11 +170,22 @@ option(RDP_RDPDR_ENABLED
        "Include MS-RDPEFS (rdpdr) drive-redirection channel handler"
        OFF)
 
+set(MACOS_RDP_VERSION "0.1.6")
 target_compile_definitions(macos-rdp-daemon PRIVATE
-    MACOS_RDP_VERSION="0.1.6"
+    MACOS_RDP_VERSION="${MACOS_RDP_VERSION}"
     MACOS_RDP_BUILD_VERSION="${MACOS_RDP_BUILD_VERSION}"
     MACOS_RDP_VIRTUAL_DISPLAY=1
 )
+
+# Embedded Info.plist (__TEXT,__info_plist): gives the bare executable a bundle
+# identifier and the usage strings macOS shows in its privacy prompts, and keeps
+# the signing identifier and CFBundleIdentifier in agreement.
+configure_file(${CMAKE_SOURCE_DIR}/daemon/Info.plist.in
+               ${CMAKE_BINARY_DIR}/daemon-Info.plist @ONLY)
+target_link_options(macos-rdp-daemon PRIVATE
+    "LINKER:-sectcreate,__TEXT,__info_plist,${CMAKE_BINARY_DIR}/daemon-Info.plist")
+set_property(TARGET macos-rdp-daemon APPEND PROPERTY
+             LINK_DEPENDS ${CMAKE_BINARY_DIR}/daemon-Info.plist)
 
 # ── Install ───────────────────────────────────────────────────────────────
 install(TARGETS macos-rdp-daemon DESTINATION /usr/local/sbin)

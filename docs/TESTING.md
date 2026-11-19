@@ -4,7 +4,7 @@ Goal: parity with the Windows Remote Desktop (mstsc) experience, and rock-solid 
 
 Status legend: ✅ working · ⚠️ partial / needs work · ❌ not implemented · ❓ untested
 
-Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates from master CI.
+Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Release binaries are built with `scripts/build-local.sh` (Developer ID) and uploaded by the owner; the updater rejects anything else.
 
 ---
 
@@ -33,6 +33,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 | 2.5 | Frame rate / smoothness | Drag a window, scroll | Fluid ~30 fps | ❓ |
 | 2.6 | Dynamic resolution change | Resize mstsc window | Session adapts | ❓ |
 | 2.7 | Non-ultrawide client (1920×1080) | Connect from 16:9 | Correct proportions | ❓ |
+| 2.7a | Dynamic resolution (MS-RDPEDISP) | Resize the client window; watch the log | `disp: client requested monitor …` appears | ⚠️ observe-only — channel receives, resize NOT applied (blocked on RESET_GRAPHICS) |
 | 2.8 | Privacy blank on connect | Set RDP_PRIVACY_BLANK=1 | Local display dims/blanks | ⚠️ (DisplayServices brightness only) |
 | 2.9 | Shared mode | Set RDP_SHARED_MODE=1 | Remote + local see same screen | ❓ |
 | 2.10 | Wake Mac on connect | Mac display asleep, then connect | Display wakes, capture starts | ✅ (IOPMAssertion) |
@@ -41,7 +42,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 | # | Item | How to test | Expected | Status |
 |---|------|-------------|----------|--------|
 | 3.1 | Mouse move (1:1 position) | Move across whole screen | Tracks accurately | ✅ |
-| 3.2 | Cursor shapes (I-beam, resize, spinner) | Hover text / window edge | Shows correct cursor | ✅ (RDP_CURSOR_SHAPES=1, 24bpp) |
+| 3.2 | Cursor shapes (I-beam, resize, spinner) | Hover text / window edge | Shows correct cursor | ✅ (24bpp; default on, `RDP_CURSOR_SHAPES=0` opts out) |
 | 3.3 | Left/right/middle click | Click around | Registers correctly | ❓ |
 | 3.4 | Click-drag | Drag a window / select text | Works | ❓ |
 | 3.5 | Scroll wheel (vert/horiz) | Scroll a page | Scrolls correct direction | ❓ |
@@ -90,9 +91,10 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 | # | Item | How to test | Expected | Status |
 |---|------|-------------|----------|--------|
 | 7.1 | Polls GitHub releases | Check daemon log | "up to date (version XXXXXXX)" every 5 min | ✅ |
-| 7.2 | Updates on new push | Push a commit | Daemon swaps and restarts within 5 min | ✅ |
+| 7.2 | Updates on a newer release | Owner uploads a Developer-ID-signed `vX.Y.Z` build (`RDP_BUILD_VERSION=vX.Y.Z scripts/build-local.sh`) | Daemon swaps and restarts within 5 min | ⚠️ needs a signed release; CI builds are rejected |
 | 7.3 | Defers while client connected | Be connected when update is available | Log "deferring: client active" | ✅ |
-| 7.4 | Re-signs after download | Inspect code signature post-update | Valid signature | ✅ |
+| 7.4 | Verifies signature, never re-signs | Offer a release asset that is unsigned, ad-hoc, or not team FQKL8883DP / `com.macosrdp.daemon` / hardened runtime | Log "verify: rejected: ...", live binary untouched | ✅ |
+| 7.6 | Refuses downgrade / same version | Release tag <= running `vX.Y.Z` | Log "no update: ..." | ✅ (`tests/test_update_version.c`) |
 | 7.5 | SHA-256 integrity check | — | Daemon verifies hash before applying | ✅ |
 
 ## 8. Session management
@@ -126,7 +128,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 ## 11. Install & configuration
 | # | Item | How to test | Expected | Status |
 |---|------|-------------|----------|--------|
-| 11.1 | User installer | Run scripts/install-user.sh on Mac | Installs, signs, loads | ⚠️ untested end-to-end |
+| 11.1 | User installer | Run scripts/install-user.sh on Mac | Verifies the Developer ID signature, installs, loads | ⚠️ untested end-to-end |
 | 11.2 | GUI config app | Open the menu-bar app | Toggle all options, start/stop | ✅ (gui/build.sh) |
 | 11.3 | Grant permissions | scripts/grant-permissions.sh | Screen Recording + Accessibility granted | ⚠️ |
 | 11.4 | Uninstall | scripts/uninstall.sh | Clean removal | ❓ |
@@ -150,9 +152,58 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Server build auto-updates
 | `RDP_ALLOW_IDLE_SLEEP` | 0 | Allow Mac to idle-sleep (breaks remote access) |
 | `RDP_UPDATE_ENABLED` | 1 | Enable auto-update |
 | `RDP_UPDATE_INTERVAL_MIN` | 5 | Auto-update check interval in minutes |
-| `RDP_SIGN_IDENTITY` | — | Codesign identity SHA-1 for re-signing after update |
-| `RDP_SIGN_KEYCHAIN` | — | Keychain path for codesigning |
-| `RDP_SIGN_KEYCHAIN_PW` | — | Keychain unlock password |
+| `RDP_UPDATE_REPO` | `grioghar/macos-rdp-server` | GitHub `owner/repo` the updater polls |
+| `RDP_UPDATE_TOKEN` | — | Optional bearer token for a private repo |
+| `RDP_VIRTUAL_DISPLAY` | 1 | `0` serves the main display instead of creating virtual displays |
+| `RDP_GFX_RESET` | 1 | `0` = legacy GFX: one fixed-size surface, no dynamic resolution, no multi-monitor |
+| `RDP_HIDPI` | 1 | `0` forces a 1x (non-Retina) desktop, ignoring `RDP_SCALE` and the client scale |
+| `RDP_SCALE` | unset (follow client) | Desktop scale in percent (>= 100); capped so the desktop stays at least 800x600 points |
+| `RDP_PHYSICAL_DISPLAYS` | aside | While a virtual display is active: `aside` moves physical displays to the right of it, `mirror` mirrors them. Restored on disconnect |
+| `RDP_NO_TCC_PROMPT` | 0 | `1` does not pop the Screen Recording / Accessibility prompts (headless and test runs) |
+| `RDP_DISPLAY_MODE_HELPER` | the daemon itself | Path of the executable run as `--set-display-mode id w h pw` to change a virtual display's mode (tests) |
+
+Security variables (`RDP_NLA`, `RDP_TLS_MIN`, `RDP_LEGACY_SECURITY`, `RDP_IDLE_TIMEOUT_MIN`, lockout, allow-lists, audit log) are documented in [security.md](security.md).
+
+## Parity with Microsoft RDP
+
+Windows host = Remote Desktop Services on Windows 10/11 or Server, with `mstsc` as client.
+
+| Feature | Windows host behaviour | macos-rdp status | How to test |
+|---|---|---|---|
+| NLA / CredSSP | Offered and usually required | Done: NTLM via a SAM file learned at first logon (`RDP_NLA=auto\|off\|require`) | Connect with mstsc; see [security.md](security.md) |
+| TLS minimum | TLS 1.2 on current builds | Done: 1.2 default, `RDP_TLS_MIN` to lower or raise | `openssl s_client -tls1_1 -connect host:3389` must fail; `-tls1_2` succeeds |
+| Legacy RDP security | Disabled by default on current builds | Done: off by default, opt in with `RDP_LEGACY_SECURITY=1` (never with `RDP_NLA=require`) | mstsc with "security: RDP" fails by default, connects with the variable set |
+| Dynamic resolution | Resize window, session resizes (DISP) | Done: DISP + GFX ResetGraphics; `RDP_GFX_RESET=0` falls back to a fixed size | Resize the mstsc window or toggle smart sizing; `tests/integration/run-display-test.sh` |
+| Multi-monitor | Up to 16 monitors in RDP; mstsc `/multimon` | Done: up to 15, one virtual display per monitor, arranged like the client | mstsc `/multimon` with 2+ screens; `run-display-test.sh --virtual` |
+| HiDPI / scale | Client scale factor applied to the session | Done: scale taken from the client; `RDP_HIDPI=0` or `RDP_SCALE=n` override | mstsc at 150% display scaling; check the Mac's resolution in Displays |
+| Clipboard | Text, HTML, RTF, images, files | Done: `RDPClipboard` engine with delayed rendering; files up to >4 GB | Copy each type both ways; `tests/run.sh` covers the engine |
+| Audio out | RDPSND to the client | Done | mstsc "play on this computer"; `RDP_AUDIO_LOCAL=0` for remote only |
+| Audio in | Microphone redirection | Done, opt in: `RDP_AUDIO_INPUT=1` | mstsc "record from this computer" |
+| Drive redirection | RDPDR, client drives appear in the session | Done: RDPDR through a WebDAV bridge; `RDP_RDPDR_ENABLED=0` disables | mstsc Local Resources > Drives |
+| Frame-ack flow control | Server paces frames on client acks | In progress | Watch the verbose log under a throttled link |
+| Adaptive bitrate | Bitrate follows measured bandwidth and RTT | In progress | Throttle the link (Network Link Conditioner) and watch quality |
+| Reconnect | Auto-reconnect after a network blip, session kept | Not implemented: a dropped connection starts a new session | Drop Wi-Fi briefly (section 10.3) |
+| Idle timeout | Session limits from policy | Done: `RDP_IDLE_TIMEOUT_MIN`, default off | Set it to 1, leave the session idle |
+| Lockout | Account lockout policy | Done: per IP and user, `RDP_LOCKOUT_*` | Five bad passwords, then connect; see [security.md](security.md) |
+| Audit log | Security event log (4624/4625) | Done: `~/Library/Logs/macos-rdp-connections.log` | Connect and disconnect, read the log |
+| Auto-update | Windows Update | Done: Developer-ID-signed, strictly newer `vX.Y.Z` releases only; `RDP_UPDATE_ENABLED=0` disables | Section 7 |
+
+## Running the tests
+
+Unit tests (no display or network changes; the clipboard tests use a private pasteboard):
+
+```bash
+RDP_DEPS_DIR=/path/to/deps tests/run.sh   # default $ROOT/build/deps; needs $RDP_DEPS_DIR/freerdp-install/include
+```
+
+Integration (headless `rdp_probe` client against a loopback, no-auth test daemon on port 33899, `RDP_TEST_PORT` to change):
+
+```bash
+tests/integration/run-display-test.sh            # serves the main display; nothing on screen changes
+tests/integration/run-display-test.sh --virtual  # real virtual displays; expects 2 monitors
+```
+
+`--virtual` temporarily moves the physical displays aside and restores them afterwards, so the screen flickers and windows may jump; do not run it while someone is working on the Mac. Variables: `RDP_PROBE_ARGS` adds client options (word-split, e.g. `RDP_PROBE_ARGS=/sec:rdp`), `RDP_TEST_LOG_LEVEL` sets the daemon log level (default `verbose`), `RDP_TEST_BIN` the binary, `RDP_TEST_LOG` the log path.
 
 ### Known issues / in progress
 1. **Drive mounting needs hardware test** — WebDAV bridge is built; test by connecting mstsc with Drives enabled.

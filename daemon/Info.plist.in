@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.macosrdp.daemon</string>
+    <key>CFBundleName</key>
+    <string>macos-rdp-daemon</string>
+    <key>CFBundleDisplayName</key>
+    <string>macOS RDP Server</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@MACOS_RDP_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@MACOS_RDP_BUILD_VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>macOS RDP Server sends this Mac's sound to the connected Remote Desktop client.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>macOS RDP Server uses audio input to carry sound between this Mac and the Remote Desktop client.</string>
+</dict>
+</plist>

@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <time.h>
 
 /* ── MS-RDPEFS (rdpdr) protocol constants ──────────────────────────────── */
 /* Packet ids from MS-RDPEFS specification §2.2.1.1 */
@@ -117,6 +118,68 @@ typedef enum {
 /* Load the server certificate + private key into the peer settings. Without
  * these, the TLS handshake cannot complete and the client aborts with a
  * connection/security error (mstsc 0x904). Returns false if either is missing. */
+/* ── Monitor layout helpers ────────────────────────────────────────────── */
+
+/* MS-RDPEDISP 2.2.2.2.1 monitor bounds; GFX surfaces and desktops are UINT16. */
+#define RDP_MON_MIN 200
+#define RDP_MON_MAX 8192
+#define RDP_DESKTOP_MAX 32766
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+bool rdp_layout_normalize(RDPMonitorLayout *l) {
+    if (!l || l->count == 0 || l->count > RDP_MAX_MONITORS) return false;
+    int32_t minX = INT32_MAX, minY = INT32_MAX;
+    int primary = -1;
+    for (uint32_t i = 0; i < l->count; i++) {
+        RDPMonitor *m = &l->monitors[i];
+        m->width  = clamp_u32(m->width,  RDP_MON_MIN, RDP_MON_MAX) & ~1u;
+        m->height = clamp_u32(m->height, RDP_MON_MIN, RDP_MON_MAX);
+        if (m->scale < 100 || m->scale > 500) m->scale = 100;
+        if (m->primary) {
+            if (primary < 0) primary = (int)i;
+            else m->primary = false;            /* exactly one primary */
+        }
+        if (m->x < minX) minX = m->x;
+        if (m->y < minY) minY = m->y;
+    }
+    if (primary < 0) l->monitors[0].primary = true;
+    uint32_t w = 0, h = 0;
+    for (uint32_t i = 0; i < l->count; i++) {
+        RDPMonitor *m = &l->monitors[i];
+        m->x -= minX;                            /* bounding box starts at (0,0) */
+        m->y -= minY;
+        if ((uint32_t)m->x + m->width  > w) w = (uint32_t)m->x + m->width;
+        if ((uint32_t)m->y + m->height > h) h = (uint32_t)m->y + m->height;
+    }
+    if (w > RDP_DESKTOP_MAX || h > RDP_DESKTOP_MAX) return false;
+    l->desktopWidth  = w;
+    l->desktopHeight = h;
+    return true;
+}
+
+bool rdp_layout_equal(const RDPMonitorLayout *a, const RDPMonitorLayout *b) {
+    if (a->count != b->count) return false;
+    for (uint32_t i = 0; i < a->count; i++) {
+        const RDPMonitor *p = &a->monitors[i], *q = &b->monitors[i];
+        if (p->x != q->x || p->y != q->y || p->width != q->width ||
+            p->height != q->height || p->scale != q->scale ||
+            p->primary != q->primary ||
+            p->physicalWidthMm != q->physicalWidthMm ||
+            p->physicalHeightMm != q->physicalHeightMm)
+            return false;
+    }
+    return true;
+}
+
 static bool peer_load_certificate(freerdp_peer *peer) {
     rdpSettings *s = peer->context->settings;
 
@@ -160,24 +223,48 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_GfxSmallCache,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_GfxThinClient,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_RemoteFxCodec,           FALSE);
-    /* Security: match the known-good sample-server config. Crucially disable
-     * NLA — it requires NTLM/md4, which our minimal OpenSSL build omits (the
-     * "md4 NTLM support not available" log line). Offer TLS (+ legacy RDP as a
-     * fallback) so mstsc negotiates TLS. */
+    /* Security. TLS is always offered unless NLA-only is requested; NLA
+     * (CredSSP/NTLM) is added when the session layer found NT hashes in the SAM
+     * file (WinPR's NTLM server reads FreeRDP_NtlmSamFile; MD4/RC4 come from the
+     * WITH_INTERNAL_MD4/RC4 build). Legacy Standard RDP Security (RC4, no server
+     * authentication) is off, as on a current Windows host: offering it lets a
+     * man in the middle strip TLS from the negotiation, and every client since
+     * Windows XP SP3 does TLS. RDP_LEGACY_SECURITY=1 re-enables it (never in
+     * NLA-only mode). */
+    const RDPPeerSecurity *sec = &((RDPPeerContext *)peer->context)->callbacks.security;
+    bool nla = sec->nlaMode != 0 && sec->samPath && *sec->samPath;
+    bool nlaOnly = nla && sec->nlaMode == 2;
     freerdp_settings_set_bool(s,   FreeRDP_UseRdpSecurityLayer,     FALSE);
-    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             TRUE);
-    freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             TRUE);
-    freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             FALSE);
+    const char *legacy = getenv("RDP_LEGACY_SECURITY");
+    bool rdpSec = !nlaOnly && legacy && strcmp(legacy, "1") == 0;
+    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             rdpSec ? TRUE : FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             nlaOnly ? FALSE : TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             nla ? TRUE : FALSE);
+    if (nla) freerdp_settings_set_string(s, FreeRDP_NtlmSamFile, sec->samPath);
     freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,             1);
+    /* TLS floor: require TLS >= 1.2 for the RDP transport (FreeRDP 3.10.3 applies
+     * FreeRDP_TLSMinVersion via SSL_CTX_set_min_proto_version in tls_prepare).
+     * RDP_TLS_MIN=1.0|1.1|1.2|1.3 overrides for very old clients. */
+    {
+        uint16_t minTls = 0x0303;                     /* TLS1_2_VERSION */
+        const char *tm = getenv("RDP_TLS_MIN");
+        if (tm && *tm) {
+            if      (!strcmp(tm, "1.0")) minTls = 0x0301;
+            else if (!strcmp(tm, "1.1")) minTls = 0x0302;
+            else if (!strcmp(tm, "1.2")) minTls = 0x0303;
+            else if (!strcmp(tm, "1.3")) minTls = 0x0304;
+            else rdp_error("RDP_TLS_MIN='%s' not recognised (1.0|1.1|1.2|1.3) — using 1.2", tm);
+        }
+        freerdp_settings_set_uint16(s, FreeRDP_TLSMinVersion, minTls);
+    }
     freerdp_settings_set_uint32(s, FreeRDP_ColorDepth,              32);
     freerdp_settings_set_bool(s,   FreeRDP_UnicodeInput,            TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasExtendedMouseEvent,   TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SoundBeepsEnabled,       FALSE);
-    /* Accept multi-monitor connections: client may send monitor layout data
-     * (e.g. "Use all my monitors" in mstsc). We create one virtual display
-     * sized to the combined DesktopWidth × DesktopHeight, which covers both
-     * the span case and the independent-monitor case from the server's side. */
+    /* Multi-monitor ("Use all my monitors" in mstsc): the client's monitor
+     * layout arrives in the MCS data and later over DISP; the session gives each
+     * monitor its own virtual display and GFX surface (see rdp_peer_set_layout). */
     freerdp_settings_set_bool(s,   FreeRDP_UseMultimon,             TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SupportMonitorLayoutPdu, TRUE);
 
@@ -193,6 +280,12 @@ static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
     pthread_mutexattr_init(&mattr);
     pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&c->xportLock, &mattr);
+    rdp_fc_init(&c->fc);
+    {
+        const char *w = getenv("RDP_GFX_MAX_INFLIGHT");
+        int n = w ? atoi(w) : 0;
+        if (n >= 1 && n <= 16) c->fc.maxInFlight = (uint32_t)n;
+    }
     pthread_mutexattr_destroy(&mattr);
     /* Open the Virtual Channel Manager — all dynamic channels live under it. */
     c->vcm = WTSOpenServerA((LPSTR)peer->context);
@@ -217,8 +310,17 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
         }
     }
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
-    if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
+    if (c->disp)   {
+        if (c->dispOpened) (void)c->disp->Close(c->disp);
+        disp_server_context_free(c->disp);
+        c->disp = NULL;
+        c->dispOpened = false;
+    }
+    /* Fails any paste still waiting on the client, waits for in-flight users, frees the channel. */
+    if (c->clip)   { rdp_clip_destroy(c->clip);              c->clip   = NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
+    if (c->imaActive) { c->imaActive = false; ima_encoder_free(&c->ima); }
+    free(c->imaBuf); c->imaBuf = NULL; c->imaCap = 0;
     /* Audio input (MS-RDPEAI) — close and release the ObjC object. */
     if (c->audioInput) { rdp_audio_input_close(c->audioInput); c->audioInput = NULL; }
     /* Close rdpdr raw WTS channel (opened when RDP_RDPDR_ENABLED=1). */
@@ -228,7 +330,7 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
         c->rdpdrEvent   = NULL;
     }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
-    if (c->clipData) { free(c->clipData); c->clipData = NULL; c->clipLen = 0; }
+    rdp_fc_destroy(&c->fc);
     pthread_mutex_destroy(&c->xportLock);
     rdp_debug("peer context freed");
 }
@@ -239,6 +341,13 @@ static BOOL peer_keyboard(rdpInput *input, UINT16 flags, UINT8 code) {
     RDPPeerContext *ctx = (RDPPeerContext *)input->context;
     if (ctx->callbacks.onKeyboard)
         ctx->callbacks.onKeyboard(ctx->callbacks.userdata, flags, code);
+    return TRUE;
+}
+
+static BOOL peer_unicode_keyboard(rdpInput *input, UINT16 flags, UINT16 code) {
+    RDPPeerContext *ctx = (RDPPeerContext *)input->context;
+    if (ctx->callbacks.onUnicodeKeyboard)
+        ctx->callbacks.onUnicodeKeyboard(ctx->callbacks.userdata, flags, code);
     return TRUE;
 }
 
@@ -256,7 +365,120 @@ static BOOL peer_mouse_ex(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
     return TRUE;
 }
 
+static BOOL peer_synchronize(rdpInput *input, UINT32 flags) {
+    RDPPeerContext *ctx = (RDPPeerContext *)input->context;
+    if (ctx->callbacks.onSynchronize)
+        ctx->callbacks.onSynchronize(ctx->callbacks.userdata, flags);
+    return TRUE;
+}
+
+/* FocusIn toggleStates use the same bit layout as KBD_SYNC_*. */
+static BOOL peer_focus_in(rdpInput *input, UINT16 toggleStates) {
+    return peer_synchronize(input, toggleStates);
+}
+
 /* ── GFX caps negotiation ──────────────────────────────────────────────── */
+
+/* (Re)builds the client's graphics output for ctx->layout: deletes the old
+ * surfaces, sends ResetGraphics (desktop size + monitor list), then one
+ * CreateSurface + MapSurfaceToOutput per monitor. Every new surface has a fresh
+ * H.264 decoder on the client, so each waits for a keyframe.
+ *
+ * ResetGraphics history: an earlier attempt left width/height at 0, and mstsc
+ * dropped the connection right after it — a 0x0 output buffer is invalid. The
+ * PDU is sent the way Windows, xrdp and FreeRDP's shadow server send it: real
+ * desktop size, monitors in desktop (bounding-box) coordinates, right/bottom
+ * inclusive, primary flagged. RDP_GFX_RESET=0 restores the old single-surface,
+ * no-reset behaviour as an escape hatch.
+ *
+ * Caller holds xportLock; requires gfxReady && layoutSet. */
+static void gfx_rebuild_surfaces_locked(RDPPeerContext *ctx) {
+    RdpgfxServerContext *gfx = ctx->gfx;
+    const RDPMonitorLayout *l = &ctx->layout;
+
+    for (uint32_t i = 0; i < ctx->surfaceCount; i++) {
+        RDPGFX_DELETE_SURFACE_PDU ds = { .surfaceId = ctx->surfaceIds[i] };
+        (void)gfx->DeleteSurface(gfx, &ds);
+    }
+    ctx->surfaceCount = 0;
+    /* Frames sent for the old surfaces may never be acked. */
+    rdp_fc_reset(&ctx->fc);
+
+    if (!ctx->legacyGfx) {
+        MONITOR_DEF defs[RDP_MAX_MONITORS];
+        for (uint32_t i = 0; i < l->count; i++) {
+            const RDPMonitor *m = &l->monitors[i];
+            defs[i].left   = m->x;
+            defs[i].top    = m->y;
+            defs[i].right  = m->x + (int32_t)m->width  - 1;
+            defs[i].bottom = m->y + (int32_t)m->height - 1;
+            defs[i].flags  = m->primary ? MONITOR_PRIMARY : 0;
+        }
+        RDPGFX_RESET_GRAPHICS_PDU rg = {
+            .width = l->desktopWidth, .height = l->desktopHeight,
+            .monitorCount = l->count, .monitorDefArray = defs,
+        };
+        UINT rc = gfx->ResetGraphics(gfx, &rg);
+        if (rc != CHANNEL_RC_OK)
+            rdp_error("ResetGraphics %ux%u (%u monitors) failed: %u",
+                      l->desktopWidth, l->desktopHeight, l->count, rc);
+    }
+
+    for (uint32_t i = 0; i < l->count; i++) {
+        const RDPMonitor *m = &l->monitors[i];
+        uint16_t sid = ctx->nextSurfaceId++;
+        if (ctx->nextSurfaceId == 0) ctx->nextSurfaceId = 1;
+
+        RDPGFX_CREATE_SURFACE_PDU cs = {
+            .surfaceId = sid, .width = (UINT16)m->width, .height = (UINT16)m->height,
+            .pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888,
+        };
+        UINT rc = gfx->CreateSurface(gfx, &cs);
+        RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU ms = {
+            .surfaceId = sid, .outputOriginX = (UINT32)m->x, .outputOriginY = (UINT32)m->y,
+        };
+        if (rc == CHANNEL_RC_OK) rc = gfx->MapSurfaceToOutput(gfx, &ms);
+        if (rc != CHANNEL_RC_OK)
+            rdp_error("GFX surface %u for monitor %u failed: %u", sid, i, rc);
+
+        ctx->surfaceIds[i]               = sid;
+        ctx->surfaceKeyframeSent[i]      = false;
+        ctx->surfaceKeyframeRequested[i] = true;
+        rdp_verbose("GFX surface %u -> monitor %u: %ux%u at (%d,%d)%s",
+                    sid, i, m->width, m->height, m->x, m->y,
+                    m->primary ? " primary" : "");
+    }
+    ctx->surfaceCount = l->count;
+
+    if (ctx->callbacks.onKeyframeRequest)
+        ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata, -1);
+    rdp_info("GFX output ready: %ux%u desktop, %u monitor(s), AVC420%s",
+             l->desktopWidth, l->desktopHeight, l->count,
+             ctx->legacyGfx ? " (legacy: no ResetGraphics)" : "");
+}
+
+
+/* MS-RDPEGFX FRAME_ACKNOWLEDGE. Runs on the run-loop thread inside the VCM pump
+ * (xportLock held); only touches the flow-control state, which has its own lock. */
+static UINT gfx_frame_acknowledge(RdpgfxServerContext *gfx,
+                                  const RDPGFX_FRAME_ACKNOWLEDGE_PDU *ack) {
+    RDPPeerContext *ctx = (RDPPeerContext *)gfx->custom;
+    rdp_fc_on_ack(&ctx->fc, ack->frameId, ack->queueDepth, mono_ms());
+    return CHANNEL_RC_OK;
+}
+
+bool rdp_peer_gfx_can_send(freerdp_peer *peer) {
+    if (!peer) return true;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    return rdp_fc_can_send(&ctx->fc, mono_ms());
+}
+
+uint32_t rdp_peer_gfx_rate_step(freerdp_peer *peer, bool *changed,
+                                uint32_t *maxInFlight, double *latencyMs, uint32_t *skips) {
+    if (!peer) { if (changed) *changed = false; return 1000; }
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    return rdp_fc_rate_step(&ctx->fc, changed, maxInFlight, latencyMs, skips);
+}
 
 static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
                                 const RDPGFX_CAPS_ADVERTISE_PDU *pdu) {
@@ -297,182 +519,76 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
     UINT rc = gfx->CapsConfirm(gfx, &confirm);
     if (rc != CHANNEL_RC_OK) { rdp_error("CapsConfirm failed: %u", rc); return rc; }
 
-    rdpSettings *s = ctx->base.peer->context->settings;
-    UINT32 w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
-    UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
-
-    /* NOTE: we deliberately do NOT send RDPGFX_RESET_GRAPHICS. Field testing showed
-     * mstsc resets the connection ~10ms after receiving our RESET_GRAPHICS PDU
-     * (before any surface frame), whereas without it the session is stable. The
-     * surface is created at the full desktop size and mapped to output origin (0,0),
-     * which mstsc composites against the negotiated desktop dimensions directly.
-     * (The earlier black screen was the P-frame-before-keyframe bug, since fixed,
-     * not a missing canvas.) If multi-monitor support is added later, RESET_GRAPHICS
-     * will be needed — but the MONITOR_DEF format must be validated against mstsc. */
-
-    RDPGFX_CREATE_SURFACE_PDU cs = {0};
-    cs.surfaceId   = ctx->surfaceId;
-    cs.width       = (UINT16)w;
-    cs.height      = (UINT16)h;
-    cs.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
-    gfx->CreateSurface(gfx, &cs);
-
-    RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU ms = {0};
-    ms.surfaceId     = ctx->surfaceId;
-    ms.outputOriginX = 0;
-    ms.outputOriginY = 0;
-    gfx->MapSurfaceToOutput(gfx, &ms);
-
     ctx->gfxReady = true;
-    /* Any frames encoded during GFX setup were dropped ("gfx not ready"), so demand
-     * a fresh IDR — the first frame the client decodes must be a keyframe. */
-    ctx->sentKeyframe = false;
-    if (ctx->callbacks.onKeyframeRequest) {
-        ctx->keyframeRequested = true;
-        ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
-    }
-    rdp_info("GFX pipeline ready (%ux%u AVC420)", w, h);
+    if (ctx->layoutSet)
+        gfx_rebuild_surfaces_locked(ctx);
+    else
+        rdp_info("GFX caps confirmed; surfaces follow once the session sets its layout");
     return CHANNEL_RC_OK;
 }
 
-/* ── Clipboard callbacks ───────────────────────────────────────────────── */
+/* ── MS-RDPEDISP (DISPLAY_CONTROL) ─────────────────────────────────────── */
 
-/* The client sent us ITS Clipboard Capabilities (MS-RDPECLIP step 3). This is
- * the first proof mstsc accepted our caps + monitor-ready and is engaging the
- * channel. We just log it; the channel layer has already latched the negotiated
- * flags (e.g. useLongFormatNames) onto the context. */
-static UINT cliprdr_client_capabilities(CliprdrServerContext *cliprdr,
-                                        const CLIPRDR_CAPABILITIES *caps) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    /* Client engaged the channel — it is now safe to advertise (ServerFormatList). */
-    if (ctx) ctx->clipReady = true;
-    UINT32 flags = 0, version = 0;
-    for (UINT32 i = 0; i < caps->cCapabilitiesSets; i++) {
-        const CLIPRDR_CAPABILITY_SET *set = &caps->capabilitySets[i];
-        if (set->capabilitySetType == CB_CAPSTYPE_GENERAL) {
-            const CLIPRDR_GENERAL_CAPABILITY_SET *g =
-                (const CLIPRDR_GENERAL_CAPABILITY_SET *)set;
-            version = g->version;
-            flags   = g->generalFlags;
-        }
-    }
-    rdp_verbose("clipboard: <- ClientCapabilities (%u sets, version=0x%08x "
-                "generalFlags=0x%08x longNames=%d)",
-                caps->cCapabilitiesSets, version, flags,
-                (flags & CB_USE_LONG_FORMAT_NAMES) ? 1 : 0);
-    return CHANNEL_RC_OK;
-}
-
-/* The client ACKed our Format List (our Mac->Win advertise). On success it will
- * follow up with a Format Data Request when the user pastes on Windows. */
-static UINT cliprdr_client_format_list_response(
-        CliprdrServerContext *cliprdr,
-        const CLIPRDR_FORMAT_LIST_RESPONSE *resp) {
-    (void)cliprdr;
-    rdp_verbose("clipboard: <- ClientFormatListResponse (flags=0x%04x %s)",
-                resp->common.msgFlags,
-                (resp->common.msgFlags & CB_RESPONSE_OK) ? "OK" : "FAIL");
-    return CHANNEL_RC_OK;
-}
-
-/* Windows copied something: the client advertises the formats it now holds. We
- * must (a) ACK the list, then (b) PULL the bytes we care about by sending a Format
- * Data Request — the client never pushes data unsolicited. We only consume text,
- * so pick CF_UNICODETEXT (preferred, lossless UTF-16) and fall back to CF_TEXT. */
-static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
-                                        const CLIPRDR_FORMAT_LIST *list) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    ctx->clipReady = true;   /* channel fully engaged — Mac->Win advertise is safe */
-    rdp_verbose("clipboard: <- ClientFormatList (%u formats)", list->numFormats);
-    for (UINT32 i = 0; i < list->numFormats; i++)
-        rdp_verbose("clipboard:    format[%u] id=0x%08x name=%s", i,
-                    list->formats[i].formatId,
-                    list->formats[i].formatName ? list->formats[i].formatName : "(none)");
-
-    /* Acknowledge the advertisement first (msgType is set by the server serializer,
-     * but a Format List RESPONSE carries CB_RESPONSE_OK in msgFlags). */
-    CLIPRDR_FORMAT_LIST_RESPONSE resp = {0};
-    resp.common.msgType  = CB_FORMAT_LIST_RESPONSE;
-    resp.common.msgFlags = CB_RESPONSE_OK;
-    cliprdr->ServerFormatListResponse(cliprdr, &resp);
-
-    /* Choose the best text format the client offers. */
-    UINT32 want = 0;
-    for (UINT32 i = 0; i < list->numFormats; i++) {
-        UINT32 id = list->formats[i].formatId;
-        if (id == CF_UNICODETEXT) { want = CF_UNICODETEXT; break; }
-        if (id == CF_TEXT)        { want = CF_TEXT; }
-    }
-    if (!want) {
-        rdp_verbose("clipboard: client offered no text format — ignoring");
+/* The client asks for a new layout (MS-RDPEDISP 2.2.2.2): its window was
+ * resized, it went full screen, or its monitors changed. Runs on FreeRDP's disp
+ * thread, so it only records the request; the session loop applies it after a
+ * debounce (rdp_peer_take_pending_layout). */
+static UINT disp_monitor_layout(DispServerContext *context,
+                                const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu) {
+    RDPPeerContext *ctx = (RDPPeerContext *)context->custom;
+    if (!pdu || pdu->NumMonitors == 0) return CHANNEL_RC_OK;
+    if (pdu->NumMonitors > RDP_MAX_MONITORS) {
+        rdp_error("disp: %u monitors requested, at most %u supported — ignored",
+                  pdu->NumMonitors, RDP_MAX_MONITORS);
         return CHANNEL_RC_OK;
     }
 
-    /* Request the bytes. The response (cliprdr_client_format_data) has no format
-     * id of its own, so stash what we asked for. */
-    ctx->clipReqFormat = want;
-    CLIPRDR_FORMAT_DATA_REQUEST dreq = {0};
-    dreq.common.msgType   = CB_FORMAT_DATA_REQUEST;
-    /* dataLen MUST be 4: FreeRDP's cliprdr_server_format_data_request allocates a
-     * stream of (common.dataLen + 8) and then writes the 4-byte requestedFormatId
-     * AFTER the 8-byte header. With dataLen=0 the stream is exactly the header and
-     * the formatId write runs off the end -> WinPR Stream_Write_UINT32 abort (the
-     * crash that locked the client out on every connect). */
-    dreq.common.dataLen   = 4;
-    dreq.requestedFormatId = want;
-    rdp_verbose("clipboard: requesting format 0x%08x from client", want);
-    cliprdr->ServerFormatDataRequest(cliprdr, &dreq);
+    RDPMonitorLayout l = { .count = pdu->NumMonitors };
+    for (UINT32 i = 0; i < pdu->NumMonitors; i++) {
+        const DISPLAY_CONTROL_MONITOR_LAYOUT *m = &pdu->Monitors[i];
+        l.monitors[i] = (RDPMonitor){
+            .x = m->Left, .y = m->Top, .width = m->Width, .height = m->Height,
+            .scale = m->DesktopScaleFactor,
+            .physicalWidthMm = m->PhysicalWidth, .physicalHeightMm = m->PhysicalHeight,
+            .primary = (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) != 0,
+        };
+        rdp_verbose("disp: monitor %u/%u %ux%u at (%d,%d) scale=%u%%%s",
+                    i + 1, pdu->NumMonitors, m->Width, m->Height, m->Left, m->Top,
+                    m->DesktopScaleFactor,
+                    (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) ? " primary" : "");
+    }
+    if (!rdp_layout_normalize(&l)) {
+        rdp_error("disp: unusable layout requested — ignored");
+        return CHANNEL_RC_OK;
+    }
+
+    pthread_mutex_lock(&ctx->xportLock);
+    ctx->pendingLayout       = l;
+    ctx->pendingLayoutValid  = true;
+    ctx->pendingLayoutTimeMs = mono_ms();
+    pthread_mutex_unlock(&ctx->xportLock);
+    rdp_info("disp: client requested %u monitor(s), desktop %ux%u",
+             l.count, l.desktopWidth, l.desktopHeight);
     return CHANNEL_RC_OK;
 }
 
-/* The client answered our Format Data Request: hand the bytes to the Mac
- * pasteboard via the onClipboard callback. The response carries no format id, so
- * we use the one we requested (clipReqFormat). */
-static UINT cliprdr_client_format_data(CliprdrServerContext *cliprdr,
-                                        const CLIPRDR_FORMAT_DATA_RESPONSE *resp) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    rdp_verbose("clipboard: <- ClientFormatDataResponse (flags=0x%04x len=%u)",
-                resp->common.msgFlags, resp->common.dataLen);
-    if ((resp->common.msgFlags & CB_RESPONSE_OK) && ctx->callbacks.onClipboard) {
-        rdp_verbose("clipboard: %u bytes from client (format 0x%08x)",
-                    resp->common.dataLen, ctx->clipReqFormat);
-        ctx->callbacks.onClipboard(ctx->callbacks.userdata,
-                                   resp->requestedFormatData,
-                                   resp->common.dataLen,
-                                   ctx->clipReqFormat ? ctx->clipReqFormat
-                                                      : (UINT32)CF_UNICODETEXT);
-    } else {
-        rdp_verbose("clipboard: client format-data response failed (flags=0x%04x)",
-                    resp->common.msgFlags);
-    }
-    return CHANNEL_RC_OK;
+static BOOL disp_channel_id_assigned(DispServerContext *context, UINT32 channelId) {
+    ((RDPPeerContext *)context->custom)->dispChannelId = channelId;
+    return TRUE;
 }
 
-/* Client pasted: it requests the bytes for a format we advertised. Reply with
- * the held host data (or an empty failure response if we have none). */
-static UINT cliprdr_client_format_data_request(
-        CliprdrServerContext *cliprdr,
-        const CLIPRDR_FORMAT_DATA_REQUEST *req) {
-    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
-    rdp_verbose("clipboard: <- ClientFormatDataRequest (format 0x%08x)",
-                req->requestedFormatId);
-
-    if (ctx->clipData && ctx->clipLen > 0 &&
-        req->requestedFormatId == ctx->clipFormat) {
-        resp.common.msgFlags     = CB_RESPONSE_OK;
-        resp.common.dataLen      = (UINT32)ctx->clipLen;
-        resp.requestedFormatData = (BYTE *)ctx->clipData;
-        rdp_verbose("clipboard: serving %zu bytes for format 0x%08x",
-                    ctx->clipLen, req->requestedFormatId);
-    } else {
-        resp.common.msgFlags = CB_RESPONSE_FAIL;
-        rdp_verbose("clipboard: data request 0x%08x but nothing matching held "
-                    "(have format 0x%08x, %zu bytes)",
-                    req->requestedFormatId, ctx->clipFormat, ctx->clipLen);
+/* The client answered a DVC Create Request. For DISP, success means we may now
+ * send our caps (max monitors / area), which is what makes the client start
+ * sending layouts. Runs inside the VCM pump (run loop, xportLock held): only
+ * flag it; the run loop sends after the pump. */
+static BOOL dvc_creation_status(void *userdata, UINT32 channelId, INT32 status) {
+    RDPPeerContext *ctx = (RDPPeerContext *)userdata;
+    if (ctx->disp && channelId == ctx->dispChannelId && channelId != 0) {
+        if (status >= 0) ctx->dispCapsPending = true;
+        else rdp_info("client declined the display-control channel (0x%08x) — "
+                      "dynamic resolution unavailable", (unsigned)status);
     }
-    cliprdr->ServerFormatDataResponse(cliprdr, &resp);
-    return CHANNEL_RC_OK;
+    return TRUE;
 }
 
 /* ── Audio activated callback ──────────────────────────────────────────── */
@@ -495,6 +611,44 @@ static uint32_t rdp_preferred_audio_rate(void) {
     if (v == 44100 || v == 48000 || v == 22050) return (uint32_t)v;
     rdp_info("RDP_AUDIO_RATE=\"%s\" not recognized — defaulting to 44100", env);
     return 44100;
+}
+
+/* RDP_AUDIO_CODEC: "auto" (default) prefers IMA ADPCM (4:1, about 353 kbps for
+ * 44.1 kHz stereo vs 1411 kbps PCM) when the client offers it and PCM otherwise;
+ * "pcm" forces PCM. */
+static bool rdp_audio_adpcm_allowed(void) {
+    const char *e = getenv("RDP_AUDIO_CODEC");
+    if (!e || !*e || strcmp(e, "auto") == 0) return true;
+    if (strcmp(e, "pcm") != 0)
+        rdp_info("RDP_AUDIO_CODEC=\"%s\" not recognized (auto|pcm) - using auto", e);
+    return strcmp(e, "pcm") != 0;
+}
+
+/* A client format we can serve from the server list: same tag/channels/rate/bits
+ * as a server format, and for ADPCM a block size our encoder can produce. */
+static bool audio_client_format_usable(RdpsndServerContext *r, UINT16 i, bool adpcm) {
+    const AUDIO_FORMAT *cf = &r->client_formats[i];
+    if (adpcm) {
+        if (cf->wFormatTag != WAVE_FORMAT_DVI_ADPCM || cf->nChannels != 2 ||
+            cf->wBitsPerSample != 4 || r->clientVersion < 8)   /* Wave2 PDU needed */
+            return false;
+        int ba = (int)cf->nBlockAlign;
+        if (ba < 16 || ba > 8192 || (ba - 8) % 8) return false;
+    } else if (cf->wFormatTag != WAVE_FORMAT_PCM) {
+        return false;
+    }
+    for (size_t j = 0; j < r->num_server_formats; j++)
+        if (audio_format_compatible(&r->server_formats[j], cf)) return true;
+    return false;
+}
+
+/* First usable client format of the wanted kind at `rate` (0 = any rate). */
+static int audio_find_format(RdpsndServerContext *r, uint32_t rate, bool adpcm) {
+    for (UINT16 i = 0; i < r->num_client_formats; i++)
+        if ((rate == 0 || r->client_formats[i].nSamplesPerSec == rate) &&
+            audio_client_format_usable(r, i, adpcm))
+            return (int)i;
+    return -1;
 }
 
 static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
@@ -545,33 +699,20 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
              preferred ? (preferred == 44100 ? "44100" :
                           preferred == 48000 ? "48000" : "22050") : "auto");
 
+    /* Order: preferred rate (ADPCM, then PCM), then any rate (ADPCM, then PCM).
+     * Rate always wins over codec: ADPCM keeps the same rate and channels as the
+     * PCM it replaces, so the pitch constraint above holds for both. */
+    const bool adpcmOk = rdp_audio_adpcm_allowed();
     int chosen = -1;
-    /* Pass 1: preferred rate (skipped when preferred == 0 / "auto"). */
     if (preferred) {
-        for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
-            if (rdpsnd->client_formats[i].nSamplesPerSec != preferred) continue;
-            for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
-                if (audio_format_compatible(&rdpsnd->server_formats[j],
-                                            &rdpsnd->client_formats[i])) {
-                    chosen = (int)i;
-                    break;
-                }
-            }
-        }
+        if (adpcmOk) chosen = audio_find_format(rdpsnd, preferred, true);
+        if (chosen < 0) chosen = audio_find_format(rdpsnd, preferred, false);
         if (chosen < 0)
             rdp_info("no compatible client format at preferred %u Hz — "
                      "falling back to first compatible format", preferred);
     }
-    /* Pass 2: first compatible format of any rate. */
-    for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
-        for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
-            if (audio_format_compatible(&rdpsnd->server_formats[j],
-                                        &rdpsnd->client_formats[i])) {
-                chosen = (int)i;
-                break;
-            }
-        }
-    }
+    if (chosen < 0 && adpcmOk) chosen = audio_find_format(rdpsnd, 0, true);
+    if (chosen < 0) chosen = audio_find_format(rdpsnd, 0, false);
 
     if (chosen < 0) {
         rdp_error("no compatible audio format found among %u client formats",
@@ -580,6 +721,24 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     }
 
     const AUDIO_FORMAT *sel = &rdpsnd->client_formats[chosen];
+    const bool useIma = (sel->wFormatTag == WAVE_FORMAT_DVI_ADPCM);
+    if (useIma) {
+        /* src_format describes the PCM we hand over: the server PCM format at
+         * the same rate and channels as the chosen client format. */
+        const AUDIO_FORMAT *pcmSrc = NULL;
+        for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
+            const AUDIO_FORMAT *sf = &rdpsnd->server_formats[j];
+            if (sf->wFormatTag == WAVE_FORMAT_PCM && sf->nChannels == sel->nChannels &&
+                sf->nSamplesPerSec == sel->nSamplesPerSec) { pcmSrc = sf; break; }
+        }
+        if (!pcmSrc || ima_encoder_init(&ctx->ima, sel->nChannels, (int)sel->nBlockAlign) != 0) {
+            rdp_error("IMA ADPCM setup failed - audio disabled");
+            return;
+        }
+        rdpsnd->src_format = (AUDIO_FORMAT *)pcmSrc;
+        ctx->imaActive = true;
+    }
+    if (!useIma)
     /* Point src_format at the selected client format BEFORE SelectFormat —
      * SelectFormat reads src_format to compute src bytes-per-frame, and it is
      * the format SendSamples describes the PCM with, so it MUST equal the
@@ -604,6 +763,8 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     }
 
     ctx->audioReady = true;
+    rdp_info("audio codec: %s (RDP_AUDIO_CODEC=%s)",
+             useIma ? "IMA ADPCM (4:1)" : "PCM", adpcmOk ? "auto" : "pcm");
     rdp_info("audio format negotiated: client idx %d (committed %u) — "
              "%u Hz, %u ch, %u-bit, tag 0x%04x — wire wFormatNo=%u, "
              "tap will resample to %u Hz (src=play rate)",
@@ -640,7 +801,15 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     if (!ctx->gfx) { rdp_error("rdpgfx_server_context_new failed"); return FALSE; }
     ctx->gfx->custom        = ctx;
     ctx->gfx->CapsAdvertise = gfx_caps_advertise;
-    ctx->surfaceId          = 1;
+    ctx->gfx->FrameAcknowledge = gfx_frame_acknowledge;
+    ctx->nextSurfaceId      = 1;
+    {
+        const char *gr = getenv("RDP_GFX_RESET");
+        ctx->legacyGfx = (gr && strcmp(gr, "0") == 0);
+        if (ctx->legacyGfx)
+            rdp_info("RDP_GFX_RESET=0: legacy GFX (one surface, no ResetGraphics, "
+                     "no dynamic resolution or multi-monitor)");
+    }
     /* External-thread mode: do NOT let GFX spawn its own thread. The default
      * (ownThread=TRUE) runs an internal loop calling rdpgfx_server_handle_messages
      * — which would race our run-loop's own handle_messages call and the encoder
@@ -651,46 +820,29 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         ctx->gfx->Initialize(ctx->gfx, TRUE);
     rdp_verbose("GFX context created (external-thread mode); open deferred");
 
-    /* Clipboard. */
-    ctx->cliprdr = cliprdr_server_context_new(ctx->vcm);
-    if (ctx->cliprdr) {
-        ctx->cliprdr->custom                   = ctx;
-        ctx->cliprdr->rdpcontext               = peer->context;
-        /* Register EVERY inbound callback BEFORE Open() so no client PDU is
-         * dropped, and so the log shows the full MS-RDPECLIP exchange. */
-        ctx->cliprdr->ClientCapabilities       = cliprdr_client_capabilities;
-        ctx->cliprdr->ClientFormatList         = cliprdr_client_format_list;
-        ctx->cliprdr->ClientFormatListResponse = cliprdr_client_format_list_response;
-        ctx->cliprdr->ClientFormatDataResponse = cliprdr_client_format_data;
-        ctx->cliprdr->ClientFormatDataRequest  = cliprdr_client_format_data_request;
-        ctx->cliprdr->useLongFormatNames       = TRUE;
-        if (ctx->cliprdr->Open(ctx->cliprdr) != CHANNEL_RC_OK) {
-            rdp_verbose("clipboard channel open failed");
-            cliprdr_server_context_free(ctx->cliprdr);
-            ctx->cliprdr = NULL;
-        } else {
-            /* We pump the channel via the shared VCM, NOT cliprdr's own Start()
-             * thread — so the server-init handshake (Clipboard Capabilities +
-             * Monitor Ready) is never sent automatically. Send it ourselves, or
-             * the client never engages and copy/paste is dead BOTH directions. */
-            CLIPRDR_GENERAL_CAPABILITY_SET general = {
-                .capabilitySetType   = CB_CAPSTYPE_GENERAL,
-                .capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN,
-                .version             = CB_CAPS_VERSION_2,
-                .generalFlags        = CB_USE_LONG_FORMAT_NAMES,
-            };
-            CLIPRDR_CAPABILITIES caps = {
-                .common = { .msgType = CB_CLIP_CAPS, .msgFlags = 0,
-                            .dataLen = 4 + CB_CAPSTYPE_GENERAL_LEN },
-                .cCapabilitiesSets = 1,
-                .capabilitySets = (CLIPRDR_CAPABILITY_SET *)&general,
-            };
-            CLIPRDR_MONITOR_READY ready = { .common = { .msgType = CB_MONITOR_READY } };
-            UINT cc = ctx->cliprdr->ServerCapabilities(ctx->cliprdr, &caps);
-            UINT mr = ctx->cliprdr->MonitorReady(ctx->cliprdr, &ready);
-            rdp_verbose("clipboard channel opened (caps=%u monitor-ready=%u)", cc, mr);
-        }
+    /* MS-RDPEDISP DISPLAY_CONTROL: lets the client resize the session (window
+     * resize, full screen, monitor changes). Like GFX it is a DVC, so Open() is
+     * deferred to the run loop until drdynvc is READY, and our caps go out once
+     * the client accepts the channel (dvc_creation_status). */
+    ctx->disp = ctx->legacyGfx ? NULL : disp_server_context_new(ctx->vcm);
+    if (!ctx->disp) {
+        if (!ctx->legacyGfx)
+            rdp_error("disp_server_context_new failed — dynamic resolution unavailable");
+    } else {
+        ctx->disp->custom            = ctx;
+        ctx->disp->rdpcontext        = peer->context;
+        ctx->disp->DispMonitorLayout = disp_monitor_layout;
+        ctx->disp->ChannelIdAssigned = disp_channel_id_assigned;
+        ctx->disp->MaxNumMonitors        = RDP_MAX_MONITORS;
+        /* MS-RDPEDISP 2.2.2.1: max area = A x B x MaxNumMonitors pixels. */
+        ctx->disp->MaxMonitorAreaFactorA = 8192;
+        ctx->disp->MaxMonitorAreaFactorB = 8192;
+        WTSVirtualChannelManagerSetDVCCreationCallback(ctx->vcm, dvc_creation_status, ctx);
+        rdp_verbose("DISP context created; open deferred");
     }
+
+    /* Clipboard (MS-RDPECLIP) — protocol engine lives in protocol/RDPClipboard.c. */
+    ctx->clip = rdp_clip_create(ctx);
 
     /* RDPDR drive-redirection static VC. Gated behind RDP_RDPDR_ENABLED=1. The
      * channel open is best-effort: if the client didn't advertise "rdpdr" in its
@@ -698,9 +850,10 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     rdp_peer_open_rdpdr(peer);
 
     /* Audio. Advertise raw PCM stereo 16-bit at the standard rates mstsc
-     * expects (48000 / 44100 / 22050). We DELIBERATELY offer only raw PCM, no
-     * compressed codecs (AAC/ADPCM/GSM): our SendSamples feeds raw PCM, so a
-     * negotiated codec would hand the client undecodable garbage.
+     * expects (48000 / 44100 / 22050), plus the same rates as IMA ADPCM unless
+     * RDP_AUDIO_CODEC=pcm. Only PCM and IMA ADPCM are offered: nothing else can
+     * be produced here (FreeRDP's own ADPCM/MS-ADPCM encoders are compiled out
+     * and broken in this build, so IMA is encoded by audio/ImaAdpcm.c).
      *
      * Why multiple rates (the pitch fix): rdpsnd_server_send_samples() does not
      * resample — the client plays our bytes at the SELECTED CLIENT FORMAT's
@@ -720,16 +873,37 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     ctx->rdpsnd = rdpsnd_server_context_new(ctx->vcm);
     if (ctx->rdpsnd) {
         static const UINT32 kRates[] = { 48000, 44100, 22050 };
-        const size_t nFmt = sizeof(kRates) / sizeof(kRates[0]);
+        const size_t nRates = sizeof(kRates) / sizeof(kRates[0]);
+        /* PCM first, then (unless RDP_AUDIO_CODEC=pcm) the same rates as IMA
+         * ADPCM with the standard Windows block size. The ADPCM entries carry
+         * cbSize=2 + samples-per-block as WAVEFORMATEX requires; the data
+         * pointers are static (FreeRDP frees only the array). */
+        static BYTE imaExtra[3][2];
+        const bool withIma = rdp_audio_adpcm_allowed();
+        const size_t nFmt = withIma ? 2 * nRates : nRates;
         AUDIO_FORMAT *pcm = (AUDIO_FORMAT *)calloc(nFmt, sizeof(AUDIO_FORMAT));
         if (pcm) {
-            for (size_t k = 0; k < nFmt; k++) {
+            for (size_t k = 0; k < nRates; k++) {
                 pcm[k].wFormatTag      = WAVE_FORMAT_PCM;
                 pcm[k].nChannels       = 2;
                 pcm[k].nSamplesPerSec  = kRates[k];
                 pcm[k].nAvgBytesPerSec = kRates[k] * 2 * 2;
                 pcm[k].nBlockAlign     = 2 * 2;
                 pcm[k].wBitsPerSample  = 16;
+                if (!withIma) continue;
+                AUDIO_FORMAT *a = &pcm[nRates + k];
+                int ba = ima_block_align(2, kRates[k]);
+                int spb = ima_samples_per_block(2, ba);
+                imaExtra[k][0] = (BYTE)(spb & 0xFF);
+                imaExtra[k][1] = (BYTE)(spb >> 8);
+                a->wFormatTag      = WAVE_FORMAT_DVI_ADPCM;
+                a->nChannels       = 2;
+                a->nSamplesPerSec  = kRates[k];
+                a->nBlockAlign     = (UINT16)ba;
+                a->nAvgBytesPerSec = (UINT32)((uint64_t)kRates[k] * (uint64_t)ba / (uint64_t)spb);
+                a->wBitsPerSample  = 4;
+                a->cbSize          = 2;
+                a->data            = imaExtra[k];
             }
         }
         ctx->rdpsnd->data               = ctx;
@@ -744,7 +918,8 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
             rdp_verbose("audio channel init failed");
             rdpsnd_server_context_free(ctx->rdpsnd);
             ctx->rdpsnd = NULL;
-        } else { rdp_verbose("audio channel opened (PCM 48000/44100/22050)"); }
+        } else { rdp_verbose("audio channel opened (PCM%s 48000/44100/22050)",
+                             withIma ? " + IMA ADPCM" : ""); }
     }
 
     /* Audio input (MS-RDPEAI mic redirection). Gated behind RDP_AUDIO_INPUT=1.
@@ -767,13 +942,16 @@ static BOOL peer_suppress_output(rdpContext *context, BYTE allow,
     (void)area;
     RDPPeerContext *ctx = (RDPPeerContext *)context;
     if (allow) {
-        ctx->outputSuppressed = false;
         /* Force a self-contained refresh so the restored window decodes. */
-        ctx->sentKeyframe = false;
-        if (ctx->callbacks.onKeyframeRequest) {
-            ctx->keyframeRequested = true;
-            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
+        pthread_mutex_lock(&ctx->xportLock);
+        ctx->outputSuppressed = false;
+        for (uint32_t i = 0; i < ctx->surfaceCount; i++) {
+            ctx->surfaceKeyframeSent[i]      = false;
+            ctx->surfaceKeyframeRequested[i] = true;
         }
+        if (ctx->callbacks.onKeyframeRequest)
+            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata, -1);
+        pthread_mutex_unlock(&ctx->xportLock);
         rdp_verbose("client output ALLOWED (restored) — forcing keyframe");
     } else {
         ctx->outputSuppressed = true;
@@ -827,6 +1005,33 @@ void rdp_peer_get_credentials(freerdp_peer *peer,
     if (domain)   *domain   = dm;
 }
 
+/* Logon hook (FreeRDP 3.10.3 libfreerdp/core/peer.c, CONNECTION_STATE_NEGO):
+ * invoked once, right after security negotiation. For NLA (`automatic` TRUE)
+ * CredSSP has finished by now and nla.c (nla_read_ts_credentials) has stored the
+ * client's delegated TSPasswordCreds in this peer's settings as FreeRDP_Domain /
+ * FreeRDP_Username / FreeRDP_Password — the SEC_WINNT_AUTH_IDENTITY argument is
+ * NOT filled on the server side. The later Client Info PDU (info.c
+ * rdp_read_info_string) overwrites those settings, so this is the only place the
+ * NLA password can be read. FreeRDP ignores our return value, so a rejection is
+ * enforced by the session layer (the callback marks the session Disconnecting).
+ * NEVER log the password. */
+static BOOL peer_logon(freerdp_peer *peer, const SEC_WINNT_AUTH_IDENTITY *identity,
+                       BOOL automatic) {
+    (void)identity;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    rdpSettings *s = peer->context->settings;
+    uint32_t proto = freerdp_settings_get_uint32(s, FreeRDP_SelectedProtocol);
+    if (!ctx->callbacks.onLogon) return TRUE;
+    const char *user = NULL, *domain = NULL, *pass = NULL;
+    if (automatic) {
+        user   = freerdp_settings_get_string(s, FreeRDP_Username);
+        domain = freerdp_settings_get_string(s, FreeRDP_Domain);
+        pass   = freerdp_settings_get_string(s, FreeRDP_Password);
+    }
+    return ctx->callbacks.onLogon(ctx->callbacks.userdata, automatic ? true : false,
+                                  proto, user, domain, pass) ? TRUE : FALSE;
+}
+
 /* ── Public API ────────────────────────────────────────────────────────── */
 
 /* Register FreeRDP's built-in server WTS implementation exactly once, before
@@ -870,14 +1075,18 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     peer_apply_settings(peer);
     peer->PostConnect = peer_post_connect;
     peer->Activate    = peer_activate;
+    peer->Logon       = peer_logon;
     /* Handle minimize/restore (Suppress Output) so the window doesn't come back
      * black. SuppressOutput lives on rdpUpdate in 3.x. */
     peer->context->update->SuppressOutput = peer_suppress_output;
 
     /* Input is on rdpContext, not on freerdp_peer in 3.x. */
-    peer->context->input->KeyboardEvent      = peer_keyboard;
-    peer->context->input->MouseEvent         = peer_mouse;
-    peer->context->input->ExtendedMouseEvent = peer_mouse_ex;
+    peer->context->input->KeyboardEvent        = peer_keyboard;
+    peer->context->input->UnicodeKeyboardEvent = peer_unicode_keyboard;
+    peer->context->input->MouseEvent           = peer_mouse;
+    peer->context->input->ExtendedMouseEvent   = peer_mouse_ex;
+    peer->context->input->SynchronizeEvent     = peer_synchronize;
+    peer->context->input->FocusInEvent         = peer_focus_in;
 
     if (!peer->Initialize(peer)) {
         rdp_error("peer Initialize failed (TLS handshake error)");
@@ -933,8 +1142,8 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
      * FormatDataResponse PDUs are never read off the wire — copy/paste is dead
      * BOTH directions even though our outbound caps/monitor-ready/format-list
      * were sent fine. THIS was the bug. */
-    if (ctx->cliprdr) {
-        HANDLE clipEvent = ctx->cliprdr->GetEventHandle(ctx->cliprdr);
+    if (ctx->clip) {
+        HANDLE clipEvent = (HANDLE)rdp_clip_event(ctx->clip);
         if (clipEvent) events[nCount++] = clipEvent;
     }
 
@@ -989,6 +1198,32 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
+    /* Same deferral for DISP: drdynvc must be READY before a DVC can open.
+     * Failure is non-fatal — the client simply can't request resolutions. */
+    if (ok && ctx->disp && !ctx->dispOpened &&
+        WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_READY) {
+        if (ctx->disp->Open(ctx->disp) == CHANNEL_RC_OK) {
+            ctx->dispOpened = true;
+            rdp_info("DISP channel opened (drdynvc ready)");
+        } else {
+            rdp_error("DISP Open failed — dynamic resolution unavailable");
+            /* Don't retry every 50ms for the life of the session. */
+            ctx->dispOpened = true;
+        }
+    }
+
+    /* The client accepted the DISP channel: advertise our limits so it starts
+     * sending monitor layouts. Without this PDU it never does. */
+    if (ok && ctx->disp && ctx->dispCapsPending) {
+        ctx->dispCapsPending = false;
+        UINT rc = ctx->disp->DisplayControlCaps(ctx->disp);
+        if (rc == CHANNEL_RC_OK)
+            rdp_info("DISP caps sent: up to %u monitors — dynamic resolution on",
+                     RDP_MAX_MONITORS);
+        else
+            rdp_error("DISP caps send failed: %u", rc);
+    }
+
     /* Drain GFX channel messages once the channel is open. */
     if (ok && ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
@@ -997,20 +1232,10 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
-    /* Drain clipboard channel messages. CheckEventHandle == cliprdr_server_read:
-     * it reads one PDU off the static channel and dispatches it to our Client*
-     * callbacks, which themselves write responses (FormatListResponse,
-     * FormatDataRequest/Response) back over the transport — hence it MUST run
-     * under xportLock, which we already hold here. This is what finally lets us
-     * SEE the client engage the clipboard. */
-    if (ok && ctx->cliprdr) {
-        HANDLE clipEvent = ctx->cliprdr->GetEventHandle(ctx->cliprdr);
-        if (clipEvent && WaitForSingleObject(clipEvent, 0) == WAIT_OBJECT_0) {
-            UINT crc = ctx->cliprdr->CheckEventHandle(ctx->cliprdr);
-            if (crc != CHANNEL_RC_OK)
-                rdp_verbose("clipboard read failed: %u", crc);
-        }
-    }
+    /* Drain clipboard channel messages (and flush deferred clipboard sends). The
+     * cliprdr callbacks write responses back over the transport, hence under
+     * xportLock, which we hold here. */
+    if (ok && ctx->clip) rdp_clip_pump(ctx->clip);
 
     /* Drain rdpdr static VC messages (RDP_RDPDR_ENABLED=1 only). */
     if (ok && ctx->rdpdrEvent &&
@@ -1032,58 +1257,182 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
     return ok;
 }
 
+/* ── Display layout API ────────────────────────────────────────────────── */
+
+void rdp_peer_get_client_layout(freerdp_peer *peer, RDPMonitorLayout *out) {
+    rdpSettings *s = peer->context->settings;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    memset(out, 0, sizeof(*out));
+
+    UINT32 globalScale = freerdp_settings_get_uint32(s, FreeRDP_DesktopScaleFactor);
+    UINT32 n = freerdp_settings_get_uint32(s, FreeRDP_MonitorCount);
+    BOOL attrs = freerdp_settings_get_bool(s, FreeRDP_HasMonitorAttributes);
+    if (n > RDP_MAX_MONITORS) {
+        rdp_error("client has %u monitors; serving the first %u", n, RDP_MAX_MONITORS);
+        n = RDP_MAX_MONITORS;
+    }
+
+    if (n >= 1 && !ctx->legacyGfx) {
+        for (UINT32 i = 0; i < n; i++) {
+            const rdpMonitor *m = freerdp_settings_get_pointer_array(
+                s, FreeRDP_MonitorDefArray, i);
+            if (!m) { n = i; break; }
+            out->monitors[i] = (RDPMonitor){
+                .x = m->x, .y = m->y,
+                .width = (uint32_t)(m->width  > 0 ? m->width  : 0),
+                .height = (uint32_t)(m->height > 0 ? m->height : 0),
+                .scale = (attrs && m->attributes.desktopScaleFactor)
+                             ? m->attributes.desktopScaleFactor : globalScale,
+                .physicalWidthMm  = attrs ? m->attributes.physicalWidth  : 0,
+                .physicalHeightMm = attrs ? m->attributes.physicalHeight : 0,
+                .primary = m->is_primary != 0,
+            };
+        }
+        out->count = n;
+    }
+    if (out->count == 0) {
+        out->count = 1;
+        out->monitors[0] = (RDPMonitor){
+            .width  = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth),
+            .height = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight),
+            .scale  = globalScale,
+            .physicalWidthMm  = freerdp_settings_get_uint32(s, FreeRDP_DesktopPhysicalWidth),
+            .physicalHeightMm = freerdp_settings_get_uint32(s, FreeRDP_DesktopPhysicalHeight),
+            .primary = true,
+        };
+    }
+    if (!rdp_layout_normalize(out)) {
+        /* Degenerate input: fall back to one sane monitor. */
+        memset(out, 0, sizeof(*out));
+        out->count = 1;
+        out->monitors[0] = (RDPMonitor){ .width = 1920, .height = 1080, .scale = 100,
+                                         .primary = true };
+        rdp_layout_normalize(out);
+    }
+}
+
+uint32_t rdp_peer_set_layout(freerdp_peer *peer, const RDPMonitorLayout *layout) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    RDPMonitorLayout l = *layout;
+    if (!rdp_layout_normalize(&l)) {
+        rdp_error("rdp_peer_set_layout: invalid layout ignored");
+        pthread_mutex_lock(&ctx->xportLock);
+        uint32_t e = ctx->layoutEpoch;
+        pthread_mutex_unlock(&ctx->xportLock);
+        return e;
+    }
+
+    pthread_mutex_lock(&ctx->xportLock);
+    ctx->layout    = l;
+    ctx->layoutSet = true;
+    uint32_t epoch = ++ctx->layoutEpoch;
+    /* A request identical to what we now serve is satisfied. */
+    if (ctx->pendingLayoutValid && rdp_layout_equal(&ctx->pendingLayout, &l))
+        ctx->pendingLayoutValid = false;
+    rdpSettings *s = peer->context->settings;
+    freerdp_settings_set_uint32(s, FreeRDP_DesktopWidth,  l.desktopWidth);
+    freerdp_settings_set_uint32(s, FreeRDP_DesktopHeight, l.desktopHeight);
+    if (ctx->gfx && ctx->gfxReady)
+        gfx_rebuild_surfaces_locked(ctx);
+    else
+        ctx->surfaceCount = 0;   /* built when the client's GFX caps arrive */
+    pthread_mutex_unlock(&ctx->xportLock);
+    return epoch;
+}
+
+bool rdp_peer_take_pending_layout(freerdp_peer *peer, RDPMonitorLayout *out,
+                                  uint32_t debounceMs) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    bool got = false;
+    pthread_mutex_lock(&ctx->xportLock);
+    if (ctx->pendingLayoutValid &&
+        mono_ms() - ctx->pendingLayoutTimeMs >= debounceMs) {
+        ctx->pendingLayoutValid = false;
+        if (!ctx->layoutSet || !rdp_layout_equal(&ctx->pendingLayout, &ctx->layout)) {
+            *out = ctx->pendingLayout;
+            got = true;
+        }
+    }
+    pthread_mutex_unlock(&ctx->xportLock);
+    return got;
+}
+
 bool rdp_peer_send_h264_frame(freerdp_peer *peer,
+                               uint32_t epoch, uint32_t monitorIndex,
                                const uint8_t *data, size_t len,
                                uint32_t width, uint32_t height,
                                bool isKeyFrame,
                                uint16_t dirtyX, uint16_t dirtyY,
                                uint16_t dirtyW, uint16_t dirtyH) {
+    if (!peer) return false;
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->gfxReady || !ctx->gfx) { rdp_debug("gfx not ready"); return false; }
+
+    /* Everything below reads layout/surface state that the run loop and the
+     * session thread change, and ends in a transport write: hold the lock. */
+    pthread_mutex_lock(&ctx->xportLock);
+    bool ok = true;
+
+    if (!ctx->gfx || !ctx->gfxReady || ctx->surfaceCount == 0) {
+        rdp_debug("gfx not ready");
+        goto out;
+    }
+    /* Encoded for a layout we no longer serve, or for a monitor that is gone:
+     * its surface no longer exists on the client. */
+    if (epoch != ctx->layoutEpoch || monitorIndex >= ctx->surfaceCount) goto out;
+    {
+        const RDPMonitor *mon = &ctx->layout.monitors[monitorIndex];
+        if (width != mon->width || height != mon->height) {
+            rdp_debug("frame %ux%u does not match monitor %u (%ux%u) — dropped",
+                      width, height, monitorIndex, mon->width, mon->height);
+            goto out;
+        }
+    }
 
     /* Client minimized: it ignores (and may choke on) graphics while output is
-     * suppressed. Drop frames until it restores (which forces a fresh keyframe). */
-    if (ctx->outputSuppressed) return true;
+     * suppressed. Drop frames until it restores (which forces fresh keyframes). */
+    if (ctx->outputSuppressed) goto out;
 
-    /* The first frame the client receives MUST be a self-contained keyframe.
-     * Frames encoded while the GFX channel was still opening were discarded, so a
-     * delta sent now references frames the client never got -> undecodable (black).
-     * Drop deltas until a keyframe goes out, asking the encoder to emit one. */
-    if (!ctx->sentKeyframe && !isKeyFrame) {
-        if (!ctx->keyframeRequested && ctx->callbacks.onKeyframeRequest) {
-            ctx->keyframeRequested = true;
-            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
-            rdp_debug("delta before first keyframe — requested IDR, dropping");
+    /* Each surface's first frame MUST be a self-contained keyframe: a delta would
+     * reference pictures that surface's decoder never got (black / decode error).
+     * Drop deltas until a keyframe goes out, asking that encoder for one. */
+    if (!ctx->surfaceKeyframeSent[monitorIndex] && !isKeyFrame) {
+        if (!ctx->surfaceKeyframeRequested[monitorIndex] &&
+            ctx->callbacks.onKeyframeRequest) {
+            ctx->surfaceKeyframeRequested[monitorIndex] = true;
+            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata,
+                                             (int32_t)monitorIndex);
+            rdp_debug("delta before first keyframe on monitor %u — requested IDR",
+                      monitorIndex);
         }
-        return true;
+        goto out;
     }
-    if (isKeyFrame) { ctx->sentKeyframe = true; ctx->keyframeRequested = false; }
+    if (isKeyFrame) {
+        ctx->surfaceKeyframeSent[monitorIndex]      = true;
+        ctx->surfaceKeyframeRequested[monitorIndex] = false;
+    }
 
-    /* Build the damage region. Keyframes refresh the whole surface, so they
-     * must claim the full extent; inter-frames claim only the dirty rect.
-     * Align to 16px macroblock boundaries and clamp to surface bounds — the
-     * AVC420 region must lie within the decoded picture or the client rejects it. */
+    /* Damage region: keyframes refresh the whole surface; deltas claim only the
+     * dirty rect, aligned to 16px macroblocks and clamped to the surface (an
+     * AVC420 region outside the decoded picture is rejected by the client). */
     RECTANGLE_16 rect;
     if (isKeyFrame || dirtyW == 0 || dirtyH == 0) {
         rect.left = 0; rect.top = 0;
         rect.right = (UINT16)width; rect.bottom = (UINT16)height;
     } else {
-        uint32_t left   = dirtyX & ~15u;                 /* round down to 16 */
+        uint32_t left   = dirtyX & ~15u;
         uint32_t top    = dirtyY & ~15u;
-        uint32_t right  = (dirtyX + dirtyW + 15u) & ~15u; /* round up to 16 */
-        uint32_t bottom = (dirtyY + dirtyH + 15u) & ~15u;
+        uint32_t right  = ((uint32_t)dirtyX + dirtyW + 15u) & ~15u;
+        uint32_t bottom = ((uint32_t)dirtyY + dirtyH + 15u) & ~15u;
         if (right  > width)  right  = width;
         if (bottom > height) bottom = height;
-        if (left   >= right)  { left = 0; right = (uint32_t)width; }
-        if (top    >= bottom) { top = 0;  bottom = (uint32_t)height; }
-        rect.left = (UINT16)left;  rect.top = (UINT16)top;
+        if (left   >= right)  { left = 0; right = width; }
+        if (top    >= bottom) { top = 0;  bottom = height; }
+        rect.left = (UINT16)left;   rect.top = (UINT16)top;
         rect.right = (UINT16)right; rect.bottom = (UINT16)bottom;
     }
 
-    /* quantQualityVals MUST be a valid parallel array — the server serializer
-     * dereferences quantQualityVals[i] for every region rect. NULL crashes.
-     * qp is a quality hint (QoE only, not decode-critical); qualityVal mirrors
-     * FreeRDP's own encoder: 100 - (qp & 0x3F). */
+    /* quantQualityVals MUST be a valid parallel array (NULL crashes the
+     * serializer). qp is a QoE hint; qualityVal mirrors FreeRDP's encoder. */
     RDPGFX_H264_QUANT_QUALITY quant = {0};
     quant.qp         = 26;
     quant.qualityVal = (BYTE)(100 - (26 & 0x3F));
@@ -1095,13 +1444,10 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     avc.meta.regionRects      = &rect;
     avc.meta.quantQualityVals = &quant;
 
-    /* The H.264 picture is full-surface, so the destination extent is too. */
     RDPGFX_SURFACE_COMMAND cmd = {0};
-    cmd.surfaceId = ctx->surfaceId;
+    cmd.surfaceId = ctx->surfaceIds[monitorIndex];
     cmd.codecId   = RDPGFX_CODECID_AVC420;
-    /* cmd.format is a FreeRDP COLOR format (color.h), not a GFX wire enum.
-     * rdpgfx_write_surface_command only accepts BGRX32/BGRA32 (-> XRGB/ARGB
-     * on the wire). Using the wire enum yields "Format UNKNOWN not supported". */
+    /* cmd.format is a FreeRDP COLOR format (color.h), not a GFX wire enum. */
     cmd.format    = PIXEL_FORMAT_BGRX32;
     cmd.right     = (UINT16)width;
     cmd.bottom    = (UINT16)height;
@@ -1109,24 +1455,25 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     cmd.data      = (BYTE *)data;
     cmd.extra     = &avc;
 
-    /* Wrap the surface command in StartFrame/EndFrame markers, like the shadow
-     * server. mstsc needs the frame boundaries (and frameId) to composite the
-     * decoded surface to the display — bare SurfaceCommands often don't render. */
+    /* StartFrame/EndFrame bracket every surface command: mstsc composites on
+     * EndFrame, and frame ids drive its acknowledgements. */
     uint32_t fid = ++ctx->frameId;
-    RDPGFX_START_FRAME_PDU startFrame = {0};
-    startFrame.frameId = fid;
-    RDPGFX_END_FRAME_PDU endFrame = {0};
-    endFrame.frameId = fid;
+    RDPGFX_START_FRAME_PDU startFrame = { .frameId = fid };
+    RDPGFX_END_FRAME_PDU   endFrame   = { .frameId = fid };
 
-    /* Serialize against ALL other transport writers (run loop, cliprdr, audio). */
-    pthread_mutex_lock(&ctx->xportLock);
     UINT rc = ctx->gfx->SurfaceFrameCommand(ctx->gfx, &cmd, &startFrame, &endFrame);
-    pthread_mutex_unlock(&ctx->xportLock);
-    if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceFrameCommand failed: %u", rc); return false; }
-    rdp_debug("sent %s frame: region=(%u,%u)-(%u,%u) len=%zu",
-              isKeyFrame ? "key" : "delta",
+    if (rc == CHANNEL_RC_OK) rdp_fc_on_send(&ctx->fc, fid, mono_ms());
+    if (rc != CHANNEL_RC_OK) {
+        rdp_error("SurfaceFrameCommand failed: %u", rc);
+        ok = false;
+        goto out;
+    }
+    rdp_debug("sent %s frame: monitor %u region=(%u,%u)-(%u,%u) len=%zu",
+              isKeyFrame ? "key" : "delta", monitorIndex,
               rect.left, rect.top, rect.right, rect.bottom, len);
-    return true;
+out:
+    pthread_mutex_unlock(&ctx->xportLock);
+    return ok;
 }
 
 void rdp_peer_send_default_cursor(freerdp_peer *peer) {
@@ -1283,6 +1630,23 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->rdpsnd || !ctx->audioReady) return false;
+    if (ctx->imaActive) {
+        /* Encode here (audio thread only), send finished blocks as a Wave2 PDU. */
+        size_t need = ima_max_output(&ctx->ima, frame_count);
+        if (need == 0) { (void)ima_encode(&ctx->ima, samples, frame_count, NULL, 0); return true; }
+        if (ctx->imaCap < need) {
+            uint8_t *nb = (uint8_t *)realloc(ctx->imaBuf, need);
+            if (!nb) return false;
+            ctx->imaBuf = nb; ctx->imaCap = need;
+        }
+        size_t n = ima_encode(&ctx->ima, samples, frame_count, ctx->imaBuf, ctx->imaCap);
+        if (n == 0) return true;
+        pthread_mutex_lock(&ctx->xportLock);
+        UINT rc2 = ctx->rdpsnd->SendSamples2(ctx->rdpsnd, ctx->rdpsnd->selected_client_format,
+                                             ctx->imaBuf, n, 0, 0);
+        pthread_mutex_unlock(&ctx->xportLock);
+        return rc2 == CHANNEL_RC_OK;
+    }
     /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature.
      * Audio runs on its own capture thread; serialize against the transport. */
     pthread_mutex_lock(&ctx->xportLock);
@@ -1291,70 +1655,9 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
     return rc == CHANNEL_RC_OK;
 }
 
-bool rdp_peer_send_clipboard(freerdp_peer *peer,
-                              const uint8_t *data, size_t len,
-                              uint32_t format) {
+RDPClipboard *rdp_peer_get_clipboard(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->cliprdr) { rdp_verbose("no clipboard channel"); return false; }
-
-    /* Store an owned copy of the host clipboard; we hand it to the client only
-     * when it sends a Format Data Request. Advertising data unsolicited (the
-     * old behaviour) violates MS-RDPECLIP and clients ignore it.
-     *
-     * Thread safety: malloc+copy happens outside the lock (no heap allocation
-     * while holding xportLock keeps the audio thread unblocked). We then
-     * take xportLock for the pointer swap, which is the same lock the reader
-     * (cliprdr_client_format_data_request) holds while accessing clipData/Len.
-     * This prevents a reader from seeing a half-updated clipData/clipLen pair. */
-    uint8_t *newClipData = (uint8_t *)malloc(len ? len : 1);
-    if (!newClipData) { rdp_verbose("clipboard: malloc failed"); return false; }
-    if (len) memcpy(newClipData, data, len);
-    uint8_t *oldClipData;
-    pthread_mutex_lock(&ctx->xportLock);
-    oldClipData      = ctx->clipData;
-    ctx->clipData    = newClipData;
-    ctx->clipLen     = len;
-    ctx->clipFormat  = format;
-    pthread_mutex_unlock(&ctx->xportLock);
-    free(oldClipData);  /* free old buffer AFTER lock released */
-
-    /* Hold the data but DO NOT advertise until the cliprdr handshake is complete.
-     * Calling ServerFormatList before the client has engaged the channel corrupts
-     * FreeRDP's cliprdr send stream and aborts the daemon (the crash-loop that gave
-     * the client 0x904). Once ready, the next pasteboard change re-advertises. */
-    if (!ctx->clipReady) {
-        rdp_verbose("clipboard: held %zu bytes (fmt 0x%08x) — channel not ready, "
-                    "advertise deferred", len, format);
-        return true;
-    }
-
-
-    /* Advertise the available format; the client requests the bytes on paste.
-     *
-     * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the
-     * FreeRDP warning "cliprdr_packet_format_list_new: called with invalid type
-     * 00000000". And a Format List is NOT a response — msgFlags must be 0, never
-     * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs).
-     *
-     * formatName MUST be a non-NULL (empty) string, NOT NULL. With
-     * useLongFormatNames=TRUE the FreeRDP serializer miscomputes the PDU length for
-     * a NULL name and under-allocates the send stream, then aborts on a
-     * Stream_Write_UINT32 (WinPR assert Stream_GetRemainingCapacity>=4) — a hard
-     * crash that took down the whole daemon mid-clipboard-exchange. An empty ""
-     * yields a 2-byte UTF-16 null terminator and a consistent length. Standard
-     * formats (CF_UNICODETEXT etc.) are still keyed by id alone. */
-    CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = (char *)"" };
-    CLIPRDR_FORMAT_LIST list = {0};
-    list.common.msgType  = CB_FORMAT_LIST;
-    list.common.msgFlags = 0;
-    list.numFormats      = 1;
-    list.formats         = &fmt;
-    /* Called from the clipboard poll thread; serialize against the transport. */
-    pthread_mutex_lock(&ctx->xportLock);
-    ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
-    pthread_mutex_unlock(&ctx->xportLock);
-    rdp_verbose("clipboard: advertised format 0x%08x (%zu bytes held)", format, len);
-    return true;
+    return ctx ? rdp_clip_retain(ctx->clip) : NULL;
 }
 
 /* ── RDPDR (MS-RDPEFS) drive-redirection implementation ─────────────────── */

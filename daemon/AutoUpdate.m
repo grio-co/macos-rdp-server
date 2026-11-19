@@ -5,6 +5,8 @@
 #import <unistd.h>
 #import <stdlib.h>
 #import <sys/stat.h>
+#import "daemon/UpdateVersion.h"
+#import "daemon/UpdateVerify.h"
 #define RDP_LOG_COMPONENT "update"
 #include "logging/RDPLog.h"
 
@@ -20,19 +22,20 @@
  *
  * FAIL-SAFE: every step is wrapped so a failure only logs + returns; the next
  * interval retries. The live binary is only ever touched at the very last step
- * (atomic rename of a fully-downloaded, sha-verified, re-signed temp file). A
+ * (atomic rename of a fully-downloaded, sha-verified, signature-verified temp file). A
  * .bak of the previous binary is kept. If anything before the swap fails the
  * temp file is deleted and the live binary is untouched.
+ *
+ * TRUST: nothing is ever re-signed. A download is installed only if it carries
+ * our Developer ID signature (see verifySignature:), the release tag is strictly
+ * newer than the running version, and the sha256 matches.
  *
  * CONFIG: see AutoUpdate.h for the full environment-variable list.
  */
 
 /* ── Defaults ─────────────────────────────────────────────────────────── */
 #define DEF_INTERVAL_MIN   5
-#define DEF_REPO           "grioghar/macos-rdp-server"
-#define DEF_SIGN_KEYCHAIN  "signing/macos-rdp.keychain-db"  /* relative to ~/.macos-rdp */
-#define DEF_SIGN_PW        "macosrdp"
-#define DEF_SIGN_IDENTITY  "5A4065DBD72516AFC58960B05B2A135B32650D44"
+#define DEF_REPO           "grio-co/macos-rdp-server"
 #define ASSET_BIN          "macos-rdp-daemon"
 #define ASSET_SHA          "macos-rdp-daemon.sha256"
 #define NET_TIMEOUT_SEC    30.0
@@ -64,12 +67,6 @@ static NSString *baseDir(void) {
 static NSString *binPath(void)  { return [baseDir() stringByAppendingPathComponent:@"bin/macos-rdp-daemon"]; }
 static NSString *tmpPath(void)  { return [baseDir() stringByAppendingPathComponent:@"bin/.update.tmp"]; }
 static NSString *bakPath(void)  { return [baseDir() stringByAppendingPathComponent:@"bin/macos-rdp-daemon.bak"]; }
-
-static NSString *signKeychain(void) {
-    const char *v = getenv("RDP_SIGN_KEYCHAIN");
-    if (v && *v) return [NSString stringWithUTF8String:v];
-    return [baseDir() stringByAppendingPathComponent:@DEF_SIGN_KEYCHAIN];
-}
 
 /* ── lifecycle ────────────────────────────────────────────────────────── */
 + (void)start {
@@ -155,8 +152,15 @@ static NSString *signKeychain(void) {
     }
 
     NSString *localVer = @MACOS_RDP_BUILD_VERSION;
-    if ([remoteVer isEqualToString:localVer]) {
-        rdp_verbose("up to date (version %s)", localVer.UTF8String);
+    int cmp = update_version_compare(remoteVer.UTF8String, localVer.UTF8String);
+    if (cmp == -2) {
+        rdp_verbose("update check: cannot compare remote '%s' with running '%s' (not release tags); not updating",
+                    remoteVer.UTF8String, localVer.UTF8String);
+        return;
+    }
+    if (cmp <= 0) {
+        rdp_verbose("no update: remote %s is %s running %s", remoteVer.UTF8String,
+                    cmp == 0 ? "the same as" : "older than", localVer.UTF8String);
         return;
     }
 
@@ -217,9 +221,9 @@ static NSString *signKeychain(void) {
     }
     rdp_info("update %s: sha256 verified", remoteVer.UTF8String);
 
-    /* Re-sign locally so TCC grants survive. */
-    if (![self resignBinary:tmp]) {
-        rdp_error("update %s: re-sign failed — aborting (live binary untouched)", remoteVer.UTF8String);
+    /* Never re-sign: the download must already carry our Developer ID signature. */
+    if (![self verifySignature:tmp]) {
+        rdp_error("update %s: signature verification failed — aborting (live binary untouched)", remoteVer.UTF8String);
         [[NSFileManager defaultManager] removeItemAtPath:tmp error:NULL];
         return;
     }
@@ -275,38 +279,14 @@ static NSString *signKeychain(void) {
     exit(0);
 }
 
-/* ── re-sign ──────────────────────────────────────────────────────────── */
-- (BOOL)resignBinary:(NSString *)path {
-    NSString *keychain = signKeychain();
-    NSString *pw       = envStr("RDP_SIGN_KEYCHAIN_PW", @DEF_SIGN_PW);
-    NSString *identity = envStr("RDP_SIGN_IDENTITY", @DEF_SIGN_IDENTITY);
-
-    /* 1. Unlock the signing keychain. */
-    if ([self runTask:@"/usr/bin/security"
-                 args:@[@"unlock-keychain", @"-p", pw, keychain]
-              timeout:15.0] != 0) {
-        rdp_error("re-sign: unlock-keychain failed for %s", keychain.UTF8String);
+/* ── signature verification (see UpdateVerify.h) ─────────────────────── */
+- (BOOL)verifySignature:(NSString *)path {
+    const char *why = NULL;
+    if (!update_verify_signature(path.fileSystemRepresentation, &why)) {
+        rdp_error("verify: rejected: %s", why);
         return NO;
     }
-
-    /* 2. Sign, pinning the stable identifier so existing TCC grants apply. */
-    if ([self runTask:@"/usr/bin/codesign"
-                 args:@[@"--keychain", keychain, @"-s", identity,
-                        @"--identifier", @"macos-rdp-daemon",
-                        @"--force", path]
-              timeout:60.0] != 0) {
-        rdp_error("re-sign: codesign failed");
-        return NO;
-    }
-
-    /* 3. Verify strictly. */
-    if ([self runTask:@"/usr/bin/codesign"
-                 args:@[@"--verify", @"--strict", path]
-              timeout:30.0] != 0) {
-        rdp_error("re-sign: codesign --verify --strict failed");
-        return NO;
-    }
-    rdp_info("re-sign: codesigned + verified (identifier macos-rdp-daemon)");
+    rdp_info("verify: Developer ID signature, identifier and hardened runtime OK");
     return YES;
 }
 

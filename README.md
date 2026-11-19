@@ -34,11 +34,20 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 > ```
 >
 > It runs the daemon as a per-user LaunchAgent (Aqua session → WindowServer → capture
-> works) and signs it with a stable self-signed certificate, so macOS pins the permission
-> grant to the signature rather than the cdhash that changes on every rebuild. No sudo.
+> works). The binary must already be Developer ID signed (build it with
+> `scripts/build-local.sh`); the installer verifies that and never re-signs, so macOS pins
+> the permission grant to a stable signature. No sudo.
+>
+> **Auto-update:** the daemon only installs a release asset that is strictly newer (tags such
+> as `v0.1.7`, compared numerically) and signed with the owner's Developer ID (team
+> `FQKL8883DP`, identifier `com.macosrdp.daemon`, hardened runtime). Nothing is re-signed.
+> CI-built release binaries are not Developer ID signed, so the updater rejects them: build
+> release binaries with `RDP_BUILD_VERSION=vX.Y.Z scripts/build-local.sh` and upload them
+> (`macos-rdp-daemon` + `macos-rdp-daemon.sha256`) to the GitHub release yourself.
+> `RDP_UPDATE_ENABLED=0` turns the updater off.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/grio-co/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 ```
 
 Downloads the latest pre-built **universal binary** (a single file that runs natively on both Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no runtime dependencies — the binary links only against macOS system frameworks.
@@ -51,13 +60,13 @@ The script will:
 
 Or download the binary directly:
 ```bash
-sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
+sudo curl -fsSL https://github.com/grio-co/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
   -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
 ```
 
 Verify the download against the published checksum:
 ```bash
-curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/SHA256SUMS | shasum -c
+curl -fsSL https://github.com/grio-co/macos-rdp-server/releases/latest/download/SHA256SUMS | shasum -c
 ```
 
 After installation, open any RDP client and connect to your Mac's IP address.
@@ -73,7 +82,7 @@ After installation, open any RDP client and connect to your Mac's IP address.
 brew install freerdp cmake openssl
 
 # 2. Clone
-git clone https://github.com/grioghar/macos-rdp-server.git
+git clone https://github.com/grio-co/macos-rdp-server.git
 cd macos-rdp-server
 
 # 3. Build & install
@@ -104,7 +113,7 @@ macOS gates the daemon's capabilities behind Privacy & Security:
 The installer opens the relevant panes automatically. To (re)run the helper:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/grant-permissions.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/grio-co/macos-rdp-server/master/scripts/grant-permissions.sh | sudo bash
 ```
 
 What it does:

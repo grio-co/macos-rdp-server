@@ -25,6 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var audioInputItem: NSMenuItem!
     // Logging
     private var logDebugItem: NSMenuItem!
+    // Display / Security / Session / Performance (table driven)
+    private lazy var advanced = AdvancedMenu { [weak self] key, value in
+        self?.setOptionAndReload(key: key, value: value)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -129,6 +133,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        advanced.install(into: menu)
+
         // ── Logging ───────────────────────────────────────────────────────
         let loggingHeader = NSMenuItem(title: "Logging", action: nil, keyEquivalent: "")
         loggingHeader.isEnabled = false
@@ -181,7 +187,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch AgentController.readEnvironment() {
         case let .success(env):
             showCursorItem.state    = (env[AgentController.EnvKey.showCursor]   == "1") ? .on : .off
-            cursorShapesItem.state  = (env[AgentController.EnvKey.cursorShapes] == "1") ? .on : .off
+            // RDP_CURSOR_SHAPES: "1"/absent = stream real shapes (default), "0" = system arrow
+            cursorShapesItem.state  = (env[AgentController.EnvKey.cursorShapes] != "0") ? .on : .off
             sharedModeItem.state    = (env[AgentController.EnvKey.sharedMode]   == "1") ? .on : .off
             privacyBlankItem.state  = (env[AgentController.EnvKey.privacyBlank] == "1") ? .on : .off
             rdpdrEnabledItem.state  = (env[AgentController.EnvKey.rdpdrEnabled] == "1") ? .on : .off
@@ -191,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let level = (env[AgentController.EnvKey.logLevel] ?? "info").lowercased()
             logDebugItem.state      = (level == "debug" || level == "verbose") ? .on : .off
             setOptionItems(enabled: true)
+            advanced.refresh(env: env)
         case .failure:
             showCursorItem.state    = .off
             cursorShapesItem.state  = .off
@@ -201,6 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             audioInputItem.state    = .off
             logDebugItem.state      = .off
             setOptionItems(enabled: false)
+            advanced.refresh(env: nil)
         }
     }
 
@@ -267,9 +276,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setOptionAndReload(key: AgentController.EnvKey.logLevel, value: newValue)
     }
 
-    /// Writes an option then, if the daemon is currently running, reloads it
+    /// Writes an option (nil removes the variable) then, if the daemon is currently running, reloads it
     /// so the change takes effect immediately.
-    private func setOptionAndReload(key: String, value: String) {
+    private func setOptionAndReload(key: String, value: String?) {
         if case let .failure(err) = AgentController.setEnvironment(key: key, value: value) {
             showAlert(title: "Could not update option", message: "\(err)")
             return

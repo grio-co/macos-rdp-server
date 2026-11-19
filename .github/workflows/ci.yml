@@ -1,6 +1,8 @@
 name: CI Build Check
 
 # Fast compile validation on every push/PR to master. arm64-only, no release.
+# NOTE: the auto-update feed job below publishes unsigned builds; the daemon
+# updater only accepts Developer-ID-signed, version-tagged (vX.Y.Z) releases.
 # Reuses the cached fork-built FreeRDP from the release workflow.
 
 on:
@@ -38,7 +40,7 @@ jobs:
         uses: actions/cache@v5.0.5
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v8-secfix
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v9-parity
 
       - name: Build FreeRDP (static, fork branch)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
@@ -66,7 +68,11 @@ jobs:
             -DWITH_CHANNELS=ON -DWITH_RDPSND=ON -DWITH_CLIPRDR=ON -DWITH_RDPGFX=ON \
             -DWITH_RDPEI=OFF -DWITH_RDPDR=ON -DWITH_SERVER_CHANNELS=ON -DWITH_PRINTER=OFF -DWITH_SMARTCARD=OFF \
             -DWITH_SERIAL=OFF -DWITH_PARALLEL=OFF -DWITH_URBDRC=OFF \
-            -DWITH_VIDEO_ENCODER=OFF -DWITH_NEON=OFF -DBUILD_TESTING=OFF \
+            -DWITH_VIDEO_ENCODER=OFF -DWITH_NEON=OFF -DBUILD_TESTING=OFF -DWITH_MANPAGES=OFF \
+            -DWITH_FAAD2=OFF -DWITH_FAAC=OFF -DWITH_SOXR=OFF -DWITH_LAME=OFF -DWITH_GSM=OFF \
+            -DWITH_JSON_DISABLED=ON -DWITH_KRB5=OFF \
+            -DWITH_INTERNAL_MD4=ON -DWITH_INTERNAL_RC4=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build "$SRC/build" --parallel "$(sysctl -n hw.logicalcpu)"
           cmake --install "$SRC/build"
@@ -93,6 +99,11 @@ jobs:
           cmake --build build --parallel "$(sysctl -n hw.logicalcpu)"
           file build/macos-rdp-daemon
           strip -x build/macos-rdp-daemon
+
+      - name: Unit tests
+        run: |
+          # tests/run.sh expects $RDP_DEPS_DIR/freerdp-install/include
+          RDP_DEPS_DIR="$HOME" tests/run.sh
 
       - name: Upload arm64 binary (for fast test deploys)
         uses: actions/upload-artifact@v7.0.1

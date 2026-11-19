@@ -18,6 +18,9 @@
  * avoids a heap allocation + grow on every frame (60/sec). */
 @property (nonatomic, strong) NSMutableData *annexBuffer;
 @property (nonatomic, assign) BOOL forceNextKeyframe;
+/* A frame was dropped or failed inside VideoToolbox: its changes never reached
+ * the client, so the next frame out covers the whole surface. VT output thread. */
+@property (atomic, assign) BOOL owesFullFrame;
 @end
 
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
@@ -150,9 +153,13 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
 
 - (void)handleSampleBuffer:(CMSampleBufferRef)buf
                   dirtyRect:(void *)refcon {
-    if (!CMSampleBufferDataIsReady(buf)) return;
+    if (!CMSampleBufferDataIsReady(buf)) { self.owesFullFrame = YES; return; }
     uint16_t dx, dy, dw, dh;
     unpack_rect(refcon, &dx, &dy, &dw, &dh);
+    if (self.owesFullFrame) {          /* 0x0 = whole surface (rdp_peer_send_h264_frame) */
+        self.owesFullFrame = NO;
+        dx = dy = dw = dh = 0;
+    }
 
     BOOL isKey = NO;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, FALSE);
@@ -210,12 +217,16 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
                          OSStatus status, VTEncodeInfoFlags infoFlags,
                          CMSampleBufferRef sampleBuffer) {
-    (void)infoFlags;
+    FrameEncoder *enc = (__bridge FrameEncoder *)outputCallbackRefCon;
     if (status != noErr) {
         rdp_error("VT encode callback error: %d", (int)status);
+        enc.owesFullFrame = YES;
         return;
     }
-    if (!sampleBuffer) return;
+    if (!sampleBuffer || (infoFlags & kVTEncodeInfo_FrameDropped)) {
+        enc.owesFullFrame = YES;
+        return;
+    }
     [(__bridge FrameEncoder *)outputCallbackRefCon handleSampleBuffer:sampleBuffer
                                                             dirtyRect:sourceFrameRefCon];
 }

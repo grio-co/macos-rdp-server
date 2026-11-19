@@ -5,25 +5,43 @@
  * The sender counts frames in flight (sent - acked). Capture consults
  * rdp_fc_can_send() BEFORE encoding and skips the frame when the window is
  * full, so an already-encoded frame is never dropped (that would break the
- * H.264 reference chain). A client that stops acking cannot freeze output: after
- * a timeout the window is forgiven. queueDepth 0xFFFFFFFF (SUSPEND) turns the
- * throttle off. rdp_fc_rate_step() derives a bitrate scale from the pressure. */
+ * H.264 reference chain).
+ *
+ * The window is the bandwidth-delay product plus two frames: the recent
+ * delivery rate (acked frames per ms) times the base latency (the lowest recent
+ * ack latency), at least maxInFlight and at most RDP_FC_HARD_CAP. A long but
+ * uncongested path (WAN, VPN) therefore keeps enough frames in flight for full
+ * frame rate. A client or link that delivers slowly gets a small window, so
+ * frames (and the control PDUs behind them) do not queue up. A client that
+ * stops acking cannot freeze output: after stallTimeoutMs without progress the
+ * window is forgiven. queueDepth 0xFFFFFFFF (SUSPEND) turns the throttle off.
+ *
+ * rdp_fc_rate_step() lowers the bitrate under congestion: queueing delay (ack
+ * latency above the base), skips while queueing (skips alone also happen while
+ * a long path's window is still growing), or a deep client queue. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
 
 #define RDP_FC_SUSPEND_ACK 0xFFFFFFFFu
 #define RDP_FC_RING 64
+#define RDP_FC_HARD_CAP 16     /* < RDP_FC_RING */
+#define RDP_FC_ACK_RING 256    /* ack times for the delivery rate */
 
 typedef struct {
     pthread_mutex_t lock;
-    uint32_t maxInFlight;     /* window; default 3 */
+    uint32_t maxInFlight;     /* minimum window; default 3 (RDP_GFX_MAX_INFLIGHT) */
     uint32_t stallTimeoutMs;  /* forgive an unacked window after this; default 1500 */
     uint32_t sentId, ackedId; /* last frame sent / acknowledged (wrap-safe) */
     bool     suspended;       /* client sent SUSPEND_FRAME_ACKNOWLEDGEMENT */
     uint64_t lastProgressMs;  /* last ack, or the send that opened the window */
     uint64_t sentMs[RDP_FC_RING];
+    uint64_t ackMs[RDP_FC_ACK_RING];   /* one entry per delivered frame */
+    uint32_t ackHead;
     double   latencyEwmaMs;
+    double   epochMinMs[2];   /* windowed minimum latency: previous, current epoch */
+    uint64_t epochStartMs;
+    bool     epochStarted;
     uint32_t lastQueueDepth;
     /* since the last rate step */
     uint32_t skips, acks, maxInFlightSeen;
@@ -44,7 +62,10 @@ void rdp_fc_on_ack(RDPFlowControl *fc, uint32_t frameId, uint32_t queueDepth,
 /* true: encode and send now. false: skip this capture (counted). */
 bool rdp_fc_can_send(RDPFlowControl *fc, uint64_t nowMs);
 uint32_t rdp_fc_in_flight(RDPFlowControl *fc);
-
+/* Lowest recent ack latency in ms, or a negative value before the first ack. */
+double rdp_fc_base_latency(RDPFlowControl *fc);
+/* Current window in frames (see above). */
+uint32_t rdp_fc_window(RDPFlowControl *fc, uint64_t nowMs);
 /* Call every ~500 ms. Returns the new scale (permille of the target bitrate,
  * 150..1000); *changed is set when it differs from the previous step. The
  * stats it consumed (since the previous step) are returned in the out params

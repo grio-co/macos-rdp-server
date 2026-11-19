@@ -520,16 +520,23 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
         p.capture = [[ScreenCapture alloc] initWithDisplayID:p.display.displayID];
         __weak FrameEncoder *wenc = p.encoder;
         __weak ScreenCapture *wcap = p.capture;
+        __block BOOL owesFullFrame = NO;   /* capture queue only */
         p.capture.frameHandler = ^(IOSurfaceRef surface, uint32_t cw, uint32_t ch,
                                    CGRect dirty) {
             (void)cw; (void)ch;
             /* Flow control BEFORE encoding: a frame already encoded is never
-             * dropped (it would break the H.264 reference chain). Skipping is
-             * safe because every frame covers the whole surface. */
+             * dropped (it would break the H.264 reference chain). The client
+             * paints only a frame's region rects, so a skipped frame's changes
+             * are owed: the next frame sent covers the whole surface. */
             freerdp_peer *fp = weak.peer;
             if (fp && !rdp_peer_gfx_can_send(fp)) {
+                owesFullFrame = YES;
                 [wcap refeedLastFrameAfterMs:33];
                 return;
+            }
+            if (owesFullFrame) {
+                owesFullFrame = NO;
+                dirty = CGRectMake(0, 0, fw, fh);
             }
             uint16_t dx = (uint16_t)MAX(0.0, dirty.origin.x);
             uint16_t dy = (uint16_t)MAX(0.0, dirty.origin.y);

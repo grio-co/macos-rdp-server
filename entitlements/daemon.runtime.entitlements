@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The only entitlement the hardened-runtime daemon needs: CoreAudio
+         capture of system audio (CATap) and the AUDIO_INPUT channel.
+         Screen Recording and Accessibility are TCC grants, not entitlements.
+         (daemon.entitlements lists restricted com.apple.developer.* keys that
+         would need a provisioning profile; it is NOT used for signing.) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

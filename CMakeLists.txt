@@ -159,11 +159,22 @@ option(RDP_RDPDR_ENABLED
        "Include MS-RDPEFS (rdpdr) drive-redirection channel handler"
        OFF)
 
+set(MACOS_RDP_VERSION "0.1.6")
 target_compile_definitions(macos-rdp-daemon PRIVATE
-    MACOS_RDP_VERSION="0.1.6"
+    MACOS_RDP_VERSION="${MACOS_RDP_VERSION}"
     MACOS_RDP_BUILD_VERSION="${MACOS_RDP_BUILD_VERSION}"
     MACOS_RDP_VIRTUAL_DISPLAY=1
 )
+
+# Embedded Info.plist (__TEXT,__info_plist): gives the bare executable a bundle
+# identifier and the usage strings macOS shows in its privacy prompts, and keeps
+# the signing identifier and CFBundleIdentifier in agreement.
+configure_file(${CMAKE_SOURCE_DIR}/daemon/Info.plist.in
+               ${CMAKE_BINARY_DIR}/daemon-Info.plist @ONLY)
+target_link_options(macos-rdp-daemon PRIVATE
+    "LINKER:-sectcreate,__TEXT,__info_plist,${CMAKE_BINARY_DIR}/daemon-Info.plist")
+set_property(TARGET macos-rdp-daemon APPEND PROPERTY
+             LINK_DEPENDS ${CMAKE_BINARY_DIR}/daemon-Info.plist)
 
 # ── Install ───────────────────────────────────────────────────────────────
 install(TARGETS macos-rdp-daemon DESTINATION /usr/local/sbin)

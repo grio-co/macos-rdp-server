@@ -189,7 +189,14 @@ static void rdp_on_keyframe_request(void *ud) {
                     _address.UTF8String);
         return;
     }
+    if (![self authenticateClient]) return;
+    if (![self claimActiveSession]) return;
+    [self startMediaForWidth:w height:h];
+}
 
+/* Validate the client's credentials. Returns NO (and marks the session
+ * Disconnecting) when the client must be rejected. */
+- (BOOL)authenticateClient {
     /* ── Authenticate BEFORE creating any virtual display ─────────────────────
      * Credentials arrived in the RDP logon (peer_activate captured them). Validate
      * against the local macOS account. Fail-closed: bad/missing creds → tear the
@@ -205,11 +212,16 @@ static void rdp_on_keyframe_request(void *ud) {
         rdp_error("authentication FAILED for %s (user='%s') — rejecting connection",
                   _address.UTF8String, user.length ? user.UTF8String : "(none)");
         _sessionState = RDPSessionStateDisconnecting;
-        return;  /* peer loop sees Disconnecting and exits → teardown, no display */
+        return NO;  /* peer loop sees Disconnecting and exits → teardown, no display */
     }
     rdp_info("authentication OK for %s (user='%s')",
              _address.UTF8String, user.length ? user.UTF8String : "(none)");
+    return YES;
+}
 
+/* Become the single active session, superseding any other. Returns NO (and
+ * marks the session Disconnecting) if activation was refused. */
+- (BOOL)claimActiveSession {
     /* ── Become the single active session (takeover) ──────────────────────────
      * Ask the server to make us active. It signals any currently-active session
      * to disconnect and BLOCKS here until that old session has released its
@@ -220,11 +232,16 @@ static void rdp_on_keyframe_request(void *ud) {
         if (![self.delegate sessionDidAuthenticateAndRequestActivation:self]) {
             rdp_info("activation refused for %s — aborting session", _address.UTF8String);
             _sessionState = RDPSessionStateDisconnecting;
-            return;
+            return NO;
         }
     }
     _activated = YES;
+    return YES;
+}
 
+/* Bring up the virtual display, capture, encoder, input, clipboard, audio and
+ * cursor streaming for an authenticated, active session. */
+- (void)startMediaForWidth:(uint32_t)w height:(uint32_t)h {
     uint32_t width  = w  ?: kDefaultWidth;
     uint32_t height = h ?: kDefaultHeight;
 

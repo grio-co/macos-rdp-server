@@ -35,6 +35,8 @@
 @property (nonatomic, assign) uint64_t lastHeartbeatFrameCount;
 @end
 
+static char kOnCaptureQueue;
+
 @implementation ScreenCapture
 
 - (instancetype)initWithDisplayID:(CGDirectDisplayID)did {
@@ -42,6 +44,7 @@
         _displayID    = did;
         _captureQueue = dispatch_queue_create("com.macosrdp.capture",
                                               DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_set_specific(_captureQueue, &kOnCaptureQueue, &kOnCaptureQueue, NULL);
     }
     return self;
 }
@@ -65,11 +68,18 @@
     if (!CGPreflightScreenCaptureAccess()) {
         rdp_error("Screen Recording not granted — requesting access (grant the prompt, "
                   "or System Settings > Privacy & Security > Screen Recording, then reconnect)");
-        CGRequestScreenCaptureAccess();
+        const char *np = getenv("RDP_NO_TCC_PROMPT");   /* headless/test runs */
+        if (!(np && strcmp(np, "1") == 0)) CGRequestScreenCaptureAccess();
     }
 
     _capturing = YES;
 
+    [self openStreamAttempt:0];
+    return YES;
+}
+
+- (void)openStreamAttempt:(int)attempt {
+    uint32_t width = _capW, height = _capH;
     __weak typeof(self) weak = self;
     /* SCShareableContent enumeration is async — set up the stream in its callback. */
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content,
@@ -86,8 +96,18 @@
         for (SCDisplay *d in content.displays) {
             if (d.displayID == self_.displayID) { target = d; break; }
         }
-        if (!target) target = content.displays.firstObject;
-        if (!target) { rdp_error("no SCDisplay available for capture"); return; }
+        if (!target) {
+            /* A display created a moment ago may not be listed yet. Retry rather
+             * than capture some other screen: with several monitors that would
+             * show the wrong one. */
+            if (attempt < 15) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                               self_.captureQueue, ^{ [weak openStreamAttempt:attempt + 1]; });
+            } else {
+                rdp_error("display %u never became available for capture", self_.displayID);
+            }
+            return;
+        }
 
         SCContentFilter *filter =
             [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
@@ -156,8 +176,6 @@
         self_.heartbeat = hb;
         dispatch_resume(hb);
     }];
-
-    return YES;
 }
 
 /* SCStreamOutput */
@@ -190,7 +208,7 @@
         rdp_verbose("capture: %llu frames", (unsigned long long)self.frameCount);
 
     ScreenCaptureFrameBlock handler = self.frameHandler;
-    if (handler)
+    if (handler && _capturing)
         handler(surface, self.capW, self.capH, CGRectMake(0, 0, self.capW, self.capH));
 }
 
@@ -210,6 +228,9 @@
         [_stream stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; }];
         _stream = nil;
     }
+    /* Let a frame already being handed to the encoder finish, so the caller can
+     * stop or replace the encoder right after this returns. */
+    if (!dispatch_get_specific(&kOnCaptureQueue)) dispatch_sync(_captureQueue, ^{});
     self.lastSurface = NULL;  /* releases */
 }
 

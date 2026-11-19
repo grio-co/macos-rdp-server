@@ -47,6 +47,17 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
 /* Make the Mac's Caps Lock match the client (KBD_SYNC_* flags). */
 - (void)synchronizeLockKeys:(uint32_t)flags;
+/* Multi-monitor mapping: rects[i] is monitor i in RDP desktop coordinates
+ * (client pixels), displays[i] the Mac display serving it. Replaces the
+ * single-display letterbox mapping; count 0 restores it. */
+- (void)setMonitorRects:(const CGRect *)rects
+               displays:(const CGDirectDisplayID *)displays
+                  count:(uint32_t)count;
+/* Single-display mapping (no virtual displays): the whole RDP desktop of
+ * sourceWidth x sourceHeight shows `displayID`, letterboxed. */
+- (void)setSingleDisplay:(CGDirectDisplayID)displayID
+             sourceWidth:(uint32_t)sourceWidth
+            sourceHeight:(uint32_t)sourceHeight;
 /* The single place RDP desktop coordinates are mapped to global Mac points. */
 - (CGPoint)globalPointForDesktopX:(uint16_t)x y:(uint16_t)y;
 /* Post key-up / button-up for everything still held (call on session end). */

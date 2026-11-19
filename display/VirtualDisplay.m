@@ -4,111 +4,152 @@
 #define RDP_LOG_COMPONENT "display"
 #include "logging/RDPLog.h"
 
-@interface VirtualDisplay ()
-@property (nonatomic, assign) CGDirectDisplayID did;
-@property (nonatomic, assign) uint32_t w;
-@property (nonatomic, assign) uint32_t h;
-@property (nonatomic, assign) BOOL created;
+/* Pixel budget fixed at creation. Mode changes within it happen in place (same
+ * displayID, no flicker of the arrangement); beyond it the display is recreated.
+ * 8K covers a HiDPI 4K desktop, so ordinary resizes never recreate. */
+static const uint32_t kMaxPixelsWide = 7680;
+static const uint32_t kMaxPixelsHigh = 4320;
+static const uint32_t kVendorID = 0x5244500u;   /* "RDP" */
 
-#if MACOS_RDP_VIRTUAL_DISPLAY
-/* Opaque pointers so the compiler doesn't need CGVirtualDisplay headers here.
- * CGVirtualDisplay and its private VirtualDisplayListener thread keep using the
- * descriptor/mode/settings objects AFTER applySettings: returns, so all of them
- * must be retained for the display's whole lifetime — otherwise they dealloc when
- * createVirtualDisplay returns and the listener thread crashes on freed memory. */
+@interface VirtualDisplay ()
+@property (nonatomic, assign) uint32_t serial;
+@property (nonatomic, assign) CGDirectDisplayID did;
+@property (nonatomic, assign) uint32_t w, h, ptsW, ptsH;
+@property (nonatomic, assign) uint32_t maxW, maxH;
+@property (nonatomic, assign) BOOL retina, virt;
+/* CGVirtualDisplay and its private listener thread keep using the descriptor,
+ * mode and settings after applySettings: returns, so all of them are retained
+ * for the display's lifetime (releasing them early was a use-after-free). */
 @property (nonatomic, strong) id vdObject;
 @property (nonatomic, strong) id vdDescriptor;
 @property (nonatomic, strong) id vdMode;
 @property (nonatomic, strong) id vdSettings;
-#endif
 @end
 
 @implementation VirtualDisplay
 
-- (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height {
-    if ((self = [super init])) {
-        _w = width;
-        _h = height;
-    }
+- (instancetype)initWithSerial:(uint32_t)serial {
+    if ((self = [super init])) _serial = serial ?: 1;
     return self;
 }
 
 - (CGDirectDisplayID)displayID { return _did; }
-- (uint32_t)width              { return _w; }
-- (uint32_t)height             { return _h; }
+- (uint32_t)width      { return _w; }
+- (uint32_t)height     { return _h; }
+- (uint32_t)pointsWide { return _ptsW; }
+- (uint32_t)pointsHigh { return _ptsH; }
+- (BOOL)hiDPI          { return _retina; }
+- (BOOL)isVirtual      { return _virt; }
 
-- (BOOL)create {
-    if (_created) return YES;
++ (void)pointsForWidth:(uint32_t)width height:(uint32_t)height
+          scalePercent:(uint32_t)scale
+                 outW:(uint32_t *)outW outH:(uint32_t *)outH
+              outHiDPI:(BOOL *)outHiDPI {
+    const char *hd = getenv("RDP_HIDPI");
+    const char *sc = getenv("RDP_SCALE");
+    if (sc && atoi(sc) >= 100) scale = (uint32_t)atoi(sc);
+    if (hd && strcmp(hd, "0") == 0) scale = 100;
+    /* A tiny Mac desktop is unusable (menu bar, dialogs); cap the scale so the
+     * desktop stays at least 800x600 points. */
+    uint32_t maxScale = MIN(width * 100 / 800, height * 100 / 600);
+    if (scale > maxScale) scale = MAX(100u, maxScale);
+    if (scale <= 100) {
+        *outW = width; *outH = height; *outHiDPI = NO;
+        return;
+    }
+    *outW = (uint32_t)lround((double)width  * 100.0 / scale);
+    *outH = (uint32_t)lround((double)height * 100.0 / scale);
+    *outHiDPI = YES;
+}
 
-#if MACOS_RDP_VIRTUAL_DISPLAY
-    [self createVirtualDisplay];
-#else
-    /* Default: capture the main display. Physical display is undisturbed
-       because RDP sessions run in a separate window-server context when
-       the daemon is launched as a login item for a specific user. */
+- (BOOL)configureWidth:(uint32_t)width height:(uint32_t)height
+          scalePercent:(uint32_t)scalePercent
+       physicalWidthMm:(uint32_t)mmW
+      physicalHeightMm:(uint32_t)mmH {
+    uint32_t pw, ph; BOOL retina;
+    [VirtualDisplay pointsForWidth:width height:height scalePercent:scalePercent
+                              outW:&pw outH:&ph outHiDPI:&retina];
+    uint32_t backW = retina ? pw * 2 : pw, backH = retina ? ph * 2 : ph;
+
+    if (_virt && _vdObject && backW <= _maxW && backH <= _maxH) {
+        if (pw == _ptsW && ph == _ptsH && retina == _retina) {
+            _w = width; _h = height;          /* capture size only */
+            return YES;
+        }
+        if ([self applyModeWidth:pw height:ph hiDPI:retina]) {
+            _w = width; _h = height; _ptsW = pw; _ptsH = ph; _retina = retina;
+            [self waitForBoundsWidth:pw height:ph];
+            rdp_info("display %u resized in place: %ux%u px -> %ux%u pt%s",
+                     _did, width, height, pw, ph, retina ? " (HiDPI)" : "");
+            return YES;
+        }
+        rdp_error("display %u: in-place mode change failed — recreating", _did);
+    }
+
+    [self destroy];
+    _w = width; _h = height; _ptsW = pw; _ptsH = ph; _retina = retina;
+    const char *vdEnv = getenv("RDP_VIRTUAL_DISPLAY");   /* 0: always use the main display */
+    if (!(vdEnv && strcmp(vdEnv, "0") == 0) &&
+        [self createWithPhysicalWidthMm:mmW heightMm:mmH]) return YES;
+
+    /* No virtual display: capture the main display, letterboxed into the
+     * client size. Only meaningful for a single monitor; the session collapses
+     * the layout accordingly. */
     _did = CGMainDisplayID();
-    rdp_info("using main display %u (%ux%u) — build with MACOS_RDP_VIRTUAL_DISPLAY=1 "
-             "for a dedicated virtual display (requires Apple entitlement)", _did, _w, _h);
-#endif
-
-    _created = YES;
-    return YES;
+    _virt = NO;
+    CGRect b = CGDisplayBounds(_did);
+    _ptsW = (uint32_t)b.size.width; _ptsH = (uint32_t)b.size.height;
+    _retina = NO;
+    rdp_error("virtual display unavailable — capturing the main display %u "
+              "(letterboxed, single monitor)", _did);
+    return _did != 0;
 }
 
 - (void)destroy {
-    if (!_created) return;
-#if MACOS_RDP_VIRTUAL_DISPLAY
-    /* Release in reverse dependency order: drop the display first (stops its
-     * listener thread), then the settings/mode/descriptor it referenced. */
+    if (!_vdObject && !_virt) { _did = 0; return; }
+    CGDirectDisplayID old = _did;
+    /* Release in reverse dependency order: the display first (stops its listener
+     * thread), then the settings/mode/descriptor it referenced. */
     _vdObject     = nil;
     _vdSettings   = nil;
     _vdMode       = nil;
     _vdDescriptor = nil;
-#endif
-    _did = 0;
-    _created = NO;
-    rdp_verbose("display released");
+    _did  = 0;
+    _virt = NO;
+    if (old) rdp_verbose("virtual display %u released", old);
 }
 
-- (void)setResolutionWidth:(uint32_t)width height:(uint32_t)height {
-    _w = width;
-    _h = height;
-    rdp_verbose("resolution set to %ux%u (takes effect on next session)", width, height);
-}
+#pragma mark - CGVirtualDisplay
 
-#if MACOS_RDP_VIRTUAL_DISPLAY
-- (void)createVirtualDisplay {
-    /*
-     * Create a CGVirtualDisplay sized exactly to the RDP client (e.g. 3440x1440)
-     * so there is no pillarbox/scaling and pointer mapping is 1:1. CGVirtualDisplay
-     * is a PRIVATE CoreGraphics API (CGVirtualDisplayDescriptor / *Mode / *Settings),
-     * driven here entirely via NSClassFromString + KVC + NSInvocation so a missing
-     * class / wrong ABI / thrown exception cleanly falls back to the main display
-     * (pillarboxed) instead of crashing the daemon.
-     */
-    _did = CGMainDisplayID();   /* safe default */
+- (BOOL)createWithPhysicalWidthMm:(uint32_t)mmW heightMm:(uint32_t)mmH {
     @try {
         Class descClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
         Class dispClass = NSClassFromString(@"CGVirtualDisplay");
         Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
         Class setClass  = NSClassFromString(@"CGVirtualDisplaySettings");
         if (!descClass || !dispClass || !modeClass || !setClass) {
-            rdp_error("CGVirtualDisplay classes unavailable on this macOS — "
-                      "using main display (pillarboxed)");
-            return;
+            rdp_error("CGVirtualDisplay classes unavailable on this macOS");
+            return NO;
         }
 
+        uint32_t backW = _retina ? _ptsW * 2 : _ptsW, backH = _retina ? _ptsH * 2 : _ptsH;
+        _maxW = MAX(kMaxPixelsWide, MAX(backW, _w));
+        _maxH = MAX(kMaxPixelsHigh, MAX(backH, _h));
+
         id desc = [[descClass alloc] init];
-        [desc setValue:@"RDP Virtual Display" forKey:@"name"];
-        [desc setValue:@(_w) forKey:@"maxPixelsWide"];
-        [desc setValue:@(_h) forKey:@"maxPixelsHigh"];
-        double dpi = 100.0;
-        CGSize mm = CGSizeMake((_w / dpi) * 25.4, (_h / dpi) * 25.4);
+        [desc setValue:[NSString stringWithFormat:@"RDP Display %u", _serial] forKey:@"name"];
+        [desc setValue:@(_maxW) forKey:@"maxPixelsWide"];
+        [desc setValue:@(_maxH) forKey:@"maxPixelsHigh"];
+        /* Physical size from the client when it is plausible, else ~96 dpi of the
+         * client's pixels. macOS uses it for the display's DPI, not for layout. */
+        CGSize mm = (mmW >= 10 && mmW <= 10000 && mmH >= 10 && mmH <= 10000)
+                        ? CGSizeMake(mmW, mmH)
+                        : CGSizeMake(_w / 96.0 * 25.4, _h / 96.0 * 25.4);
         [desc setValue:[NSValue valueWithBytes:&mm objCType:@encode(CGSize)]
                 forKey:@"sizeInMillimeters"];
-        @try { [desc setValue:@(0x5244500u) forKey:@"productID"]; } @catch (id e) {}
-        @try { [desc setValue:@(0x5244500u) forKey:@"vendorID"];  } @catch (id e) {}
-        @try { [desc setValue:@(1)          forKey:@"serialNum"]; } @catch (id e) {}
+        @try { [desc setValue:@(kVendorID) forKey:@"productID"]; } @catch (id e) {}
+        @try { [desc setValue:@(kVendorID) forKey:@"vendorID"];  } @catch (id e) {}
+        @try { [desc setValue:@(_serial)   forKey:@"serialNum"]; } @catch (id e) {}
         @try { [desc setValue:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0)
                        forKey:@"queue"]; } @catch (id e) {}
 
@@ -117,91 +158,90 @@
         id vd = [[dispClass alloc] performSelector:@selector(initWithDescriptor:)
                                          withObject:desc];
 #pragma clang diagnostic pop
-        if (!vd) { rdp_error("CGVirtualDisplay init failed — main display"); return; }
+        if (!vd) { rdp_error("CGVirtualDisplay init failed"); return NO; }
 
-        /* Build a mode via NSInvocation (scalar args). Signature is assumed
-         * (unsigned int width, unsigned int height, double refreshRate).
-         *
-         * initWithWidth:... is an init-family method: it initialises the alloc'd
-         * receiver in place and returns self. We deliberately use the alloc'd
-         * object `m` directly rather than reading getReturnValue + __bridge — that
-         * earlier pattern gave ARC two independent strong references (m and the
-         * bridged return) to one +1 object and over-released it (SIGSEGV in
-         * objc_release). With a single strong `m`, ARC owns exactly one +1. */
-        id mode = nil;
-        SEL modeSel = @selector(initWithWidth:height:refreshRate:);
-        if ([modeClass instancesRespondToSelector:modeSel]) {
-            id m = [modeClass alloc];
-            NSMethodSignature *sig = [m methodSignatureForSelector:modeSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = m; inv.selector = modeSel;
-            unsigned int w = _w, h = _h; double rr = 60.0;
-            [inv setArgument:&w atIndex:2];
-            [inv setArgument:&h atIndex:3];
-            [inv setArgument:&rr atIndex:4];
-            [inv invoke];                 /* initialises m in place, returns self */
-            mode = m;
-        }
-        if (!mode) { rdp_error("CGVirtualDisplayMode init failed — main display"); return; }
-
-        id settings = [[setClass alloc] init];
-        [settings setValue:@[mode] forKey:@"modes"];
-        @try { [settings setValue:@(0) forKey:@"hiDPI"]; } @catch (id e) {}
-
-        BOOL applied = NO;
-        SEL applySel = @selector(applySettings:);
-        if ([vd respondsToSelector:applySel]) {
-            NSMethodSignature *sig2 = [vd methodSignatureForSelector:applySel];
-            NSInvocation *inv2 = [NSInvocation invocationWithMethodSignature:sig2];
-            inv2.target = vd; inv2.selector = applySel;
-            [inv2 setArgument:&settings atIndex:2];
-            [inv2 retainArguments];   /* NSInvocation won't outlive `settings` otherwise */
-            [inv2 invoke];
-            [inv2 getReturnValue:&applied];
+        _vdObject = vd;
+        _vdDescriptor = desc;
+        if (![self applyModeWidth:_ptsW height:_ptsH hiDPI:_retina]) {
+            rdp_error("CGVirtualDisplay applySettings failed");
+            _vdObject = nil; _vdDescriptor = nil;
+            return NO;
         }
 
         CGDirectDisplayID vdid = 0;
         @try { vdid = (CGDirectDisplayID)[[vd valueForKey:@"displayID"] unsignedIntValue]; }
         @catch (id e) {}
-        if (vdid != 0) {
-            /* Retain ALL of these for the display's lifetime — CGVirtualDisplay and
-             * its listener thread reference the descriptor (and its queue), the mode,
-             * and the settings after this function returns. Letting them dealloc here
-             * was a use-after-free that crashed the daemon mid-session. */
-            _vdObject     = vd;
-            _vdDescriptor = desc;
-            _vdMode       = mode;
-            _vdSettings   = settings;
-            _did = vdid;
-            rdp_info("virtual display created: displayID=%u %ux%u (applied=%d)",
-                     _did, _w, _h, applied);
-
-            /* Make the virtual display the MAIN display so the menu bar, Dock, and
-             * newly-opened windows land ON it. Otherwise apps open on the built-in
-             * screen, invisible to the RDP session ("windows never pop up"). Give the
-             * new display a moment to register, then put it at the global origin
-             * (0,0) = main, and move the former main (built-in) to its right. */
-            usleep(400000);
-            CGDirectDisplayID oldMain = CGMainDisplayID();
-            if (oldMain != _did) {
-                CGDisplayConfigRef dcfg = NULL;
-                if (CGBeginDisplayConfiguration(&dcfg) == kCGErrorSuccess) {
-                    CGConfigureDisplayOrigin(dcfg, _did, 0, 0);
-                    CGConfigureDisplayOrigin(dcfg, oldMain, (int32_t)_w, 0);
-                    CGError ce = CGCompleteDisplayConfiguration(dcfg, kCGConfigureForSession);
-                    rdp_info("virtual display %u set as main (built-in %u moved aside, rc=%d)",
-                             _did, oldMain, ce);
-                }
-            }
-        } else {
-            rdp_error("virtual display has no displayID — main display");
+        if (!vdid) {
+            rdp_error("virtual display has no displayID");
+            [self destroy];
+            return NO;
         }
+        _did = vdid;
+        _virt = YES;
+        [self waitForBoundsWidth:_ptsW height:_ptsH];
+        rdp_info("virtual display %u created: %ux%u px client, %ux%u pt%s",
+                 _did, _w, _h, _ptsW, _ptsH, _retina ? " (HiDPI 2x)" : "");
+        return YES;
     } @catch (NSException *e) {
-        rdp_error("virtual display creation threw (%s) — main display",
-                  e.reason.UTF8String ?: "?");
-        _did = CGMainDisplayID();
+        rdp_error("virtual display creation threw (%s)", e.reason.UTF8String ?: "?");
+        [self destroy];
+        return NO;
     }
 }
-#endif
+
+/* Builds a one-mode settings object and applies it. With hiDPI the mode size is
+ * in points and macOS renders it at 2x (backing must fit maxPixels). */
+- (BOOL)applyModeWidth:(uint32_t)pw height:(uint32_t)ph hiDPI:(BOOL)retina {
+    Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+    Class setClass  = NSClassFromString(@"CGVirtualDisplaySettings");
+    if (!_vdObject || !modeClass || !setClass) return NO;
+
+    /* initWithWidth:height:refreshRate: is init-family: it initialises the
+     * alloc'd receiver in place. Keep the single strong `m` (bridging the
+     * invocation's return value as well over-released it). */
+    SEL modeSel = @selector(initWithWidth:height:refreshRate:);
+    if (![modeClass instancesRespondToSelector:modeSel]) return NO;
+    id m = [modeClass alloc];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:
+                            [m methodSignatureForSelector:modeSel]];
+    inv.target = m; inv.selector = modeSel;
+    unsigned int w = pw, h = ph; double rr = 60.0;
+    [inv setArgument:&w atIndex:2];
+    [inv setArgument:&h atIndex:3];
+    [inv setArgument:&rr atIndex:4];
+    [inv invoke];
+
+    id settings = [[setClass alloc] init];
+    [settings setValue:@[m] forKey:@"modes"];
+    @try { [settings setValue:@(retina ? 1 : 0) forKey:@"hiDPI"]; } @catch (id e) {}
+
+    BOOL applied = NO;
+    SEL applySel = @selector(applySettings:);
+    if (![_vdObject respondsToSelector:applySel]) return NO;
+    NSInvocation *inv2 = [NSInvocation invocationWithMethodSignature:
+                             [_vdObject methodSignatureForSelector:applySel]];
+    inv2.target = _vdObject; inv2.selector = applySel;
+    [inv2 setArgument:&settings atIndex:2];
+    [inv2 retainArguments];
+    [inv2 invoke];
+    [inv2 getReturnValue:&applied];
+    if (applied) { _vdMode = m; _vdSettings = settings; }
+    return applied;
+}
+
+/* A new display or mode takes a moment to reach the window server; capture and
+ * arrangement must not run against the old geometry. Bounded wait. */
+- (void)waitForBoundsWidth:(uint32_t)pw height:(uint32_t)ph {
+    for (int i = 0; i < 40; i++) {
+        if (_did) {
+            CGRect b = CGDisplayBounds(_did);
+            if ((uint32_t)b.size.width == pw && (uint32_t)b.size.height == ph) return;
+        }
+        usleep(50000);
+    }
+    CGRect b = CGDisplayBounds(_did);
+    rdp_verbose("display %u: bounds %gx%g after 2s (wanted %ux%u pt)",
+                _did, b.size.width, b.size.height, pw, ph);
+}
 
 @end

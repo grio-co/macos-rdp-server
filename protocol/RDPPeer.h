@@ -20,7 +20,38 @@ typedef void (*RDPPeerInputCallback)(void *userdata, uint16_t flags, uint16_t co
 typedef void (*RDPPeerMouseCallback)(void *userdata, uint16_t flags, uint16_t x, uint16_t y);
 typedef void (*RDPPeerClipboardCallback)(void *userdata, const uint8_t *data, size_t len, uint32_t format);
 typedef void (*RDPPeerReadyCallback)(void *userdata, uint32_t width, uint32_t height, uint32_t colorDepth);
-typedef void (*RDPPeerKeyframeCallback)(void *userdata);
+/* monitorIndex: the monitor whose encoder must emit an IDR, or -1 for all. */
+typedef void (*RDPPeerKeyframeCallback)(void *userdata, int32_t monitorIndex);
+
+/* ── Monitor layout ─────────────────────────────────────────────────────────
+ * The client's monitors in DESKTOP coordinates: client pixels, origin at the
+ * top-left of the bounding box of all monitors (so x/y are never negative).
+ * That is the space RDP pointer events and GFX MapSurfaceToOutput use. Each
+ * monitor gets its own Mac virtual display, capture, encoder and GFX surface. */
+/* MS-RDPEGFX allows 16 monitors in ResetGraphics, but FreeRDP's serializer
+ * rejects monitorCount >= 16, so 15 is the real ceiling. */
+#define RDP_MAX_MONITORS 15
+
+typedef struct {
+    int32_t  x, y;           /* top-left in desktop coordinates */
+    uint32_t width, height;  /* client pixels (what we capture and encode) */
+    uint32_t scale;          /* desktop scale factor, percent (100 = 1:1) */
+    uint32_t physicalWidthMm, physicalHeightMm; /* 0 if the client didn't say */
+    bool     primary;
+} RDPMonitor;
+
+typedef struct {
+    uint32_t   count;
+    uint32_t   desktopWidth, desktopHeight;   /* bounding box */
+    RDPMonitor monitors[RDP_MAX_MONITORS];
+} RDPMonitorLayout;
+
+/* Normalizes a layout in place: clamps sizes to what GFX/RDPEDISP allow, makes
+ * widths even, ensures exactly one primary (first monitor if none), shifts the
+ * coordinates so the bounding box starts at (0,0), and fills desktopWidth/Height.
+ * Returns false if the layout is unusable (no monitors, or too many). */
+bool rdp_layout_normalize(RDPMonitorLayout *layout);
+bool rdp_layout_equal(const RDPMonitorLayout *a, const RDPMonitorLayout *b);
 /* Keyboard lock-key sync; flags use KBD_SYNC_* bits (caps 0x4). */
 typedef void (*RDPPeerSyncCallback)(void *userdata, uint32_t flags);
 
@@ -43,9 +74,11 @@ typedef struct {
     RDPPeerSyncCallback      onSynchronize;
     RDPPeerClipboardCallback onClipboard;
     RDPPeerReadyCallback     onReady;
-    /* Asks the encoder to emit an IDR keyframe ASAP. Invoked when the GFX channel
-     * becomes ready (frames encoded earlier were discarded, so the first sent
-     * frame must be a keyframe) or when a delta arrives before any keyframe. */
+    /* Asks an encoder (or all, monitorIndex -1) to emit an IDR keyframe ASAP.
+     * Invoked when GFX surfaces are (re)created, when output resumes after a
+     * minimize, or when a delta arrives before that surface's first keyframe.
+     * Called with xportLock held, from the run loop or an encoder thread: it must
+     * only set a flag, never block or call back into the peer. */
     RDPPeerKeyframeCallback  onKeyframeRequest;
     void *userdata;
 } RDPPeerCallbacks;
@@ -58,16 +91,36 @@ struct rdp_peer_context {
     RDPPeerCallbacks    callbacks;
     HANDLE              vcm;        /* WTSOpenServerA handle — owns gfx/cliprdr/rdpsnd */
     RdpgfxServerContext *gfx;
-    /* MS-RDPEDISP DISPLAY_CONTROL DVC. Currently OBSERVE-ONLY: it records what
-     * resolution the client asks for but does not act on it, because applying a
-     * resize needs RDPGFX_RESET_GRAPHICS, which mstsc currently reacts to by
-     * resetting the connection (see gfx_caps_advertise). Landing the receive path
-     * first makes that blocker diagnosable without risking the session. */
+    /* MS-RDPEDISP DISPLAY_CONTROL DVC: the client asks for a new monitor layout
+     * when its window is resized, it goes full screen, or monitors change.
+     * FreeRDP runs this channel on its OWN thread, so the callback only records
+     * the request (pendingLayout, under xportLock); the session loop applies it
+     * after a short debounce. */
     DispServerContext   *disp;
     CliprdrServerContext *cliprdr;
     RdpsndServerContext  *rdpsnd;
-    uint32_t             surfaceId;
     uint32_t             frameId;    /* monotonic GFX frame id for StartFrame/EndFrame */
+    /* Current layout and one GFX surface per monitor (surfaceCount == 0 until
+     * both a layout is set and the client's GFX caps arrived). Frames tagged
+     * with an older layoutEpoch are dropped. All guarded by xportLock. */
+    RDPMonitorLayout     layout;
+    bool                 layoutSet;          /* session supplied a layout */
+    uint32_t             layoutEpoch;        /* bumped by rdp_peer_set_layout */
+    bool                 legacyGfx;          /* RDP_GFX_RESET=0: no ResetGraphics,
+                                                one surface, DISP not offered */
+    uint16_t             nextSurfaceId;
+    uint16_t             surfaceIds[RDP_MAX_MONITORS];
+    uint32_t             surfaceCount;
+    bool                 surfaceKeyframeSent[RDP_MAX_MONITORS];
+    bool                 surfaceKeyframeRequested[RDP_MAX_MONITORS];
+    /* DISP caps go out once the client confirms the DVC is open (MS-RDPEDYC:
+     * no data before the Create Response); then it may send layouts. */
+    uint32_t             dispChannelId;
+    bool                 dispCapsPending;
+    /* Client-requested layout (DISP) awaiting the session loop. */
+    RDPMonitorLayout     pendingLayout;
+    bool                 pendingLayoutValid;
+    uint64_t             pendingLayoutTimeMs;
     /* Serializes ALL writes to the single RDP transport (TLS socket). FreeRDP is
      * NOT thread-safe for concurrent sends: the encoder thread (GFX SurfaceCommand),
      * the run-loop thread (CheckFileDescriptor + VCM pump + GFX handle_messages),
@@ -80,9 +133,7 @@ struct rdp_peer_context {
     pthread_mutex_t      xportLock;
     bool                 gfxOpened;  /* GFX DVC Open() succeeded (drdynvc ready) */
     bool                 dispOpened; /* DISP DVC Open() succeeded (drdynvc ready) */
-    bool                 gfxReady;   /* client sent GFX caps; surface mapped */
-    bool                 sentKeyframe;     /* a keyframe has been sent this session */
-    bool                 keyframeRequested;/* debounce: requested an IDR, awaiting it */
+    bool                 gfxReady;   /* client sent GFX caps; surfaces mapped */
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
@@ -152,22 +203,51 @@ void rdp_peer_get_credentials(freerdp_peer *peer,
                               const char **password,
                               const char **domain);
 
+/* ── Display layout (multi-monitor, dynamic resolution) ─────────────────────
+ *
+ * The session serves one GFX surface per client monitor. The flow is:
+ *   activation   rdp_peer_get_client_layout() -> session builds displays ->
+ *                rdp_peer_set_layout()
+ *   resize/      the client sends an MS-RDPEDISP layout; the session polls
+ *   monitor      rdp_peer_take_pending_layout(), rebuilds its displays and calls
+ *   change       rdp_peer_set_layout() again.
+ * rdp_peer_set_layout() sends ResetGraphics + CreateSurface/MapSurfaceToOutput
+ * per monitor (or defers that until the client's GFX caps arrive) and returns a
+ * new layout epoch. Frames carry the epoch they were encoded for; frames from an
+ * older layout reference surfaces that no longer exist and are dropped. */
+
+/* The layout the client announced at connect: its monitor list (Client Monitor
+ * Data, plus Monitor Ex for per-monitor scale/physical size) or, for a single-
+ * monitor client, DesktopWidth x DesktopHeight at its desktop scale factor.
+ * Normalized. Valid once activated. */
+void     rdp_peer_get_client_layout(freerdp_peer *peer, RDPMonitorLayout *out);
+
+/* Installs the layout the session now serves (normalized copy) and returns its
+ * epoch. Thread-safe (takes xportLock). */
+uint32_t rdp_peer_set_layout(freerdp_peer *peer, const RDPMonitorLayout *layout);
+
+/* Takes the client's latest layout request (MS-RDPEDISP) once no newer request
+ * has arrived for debounceMs (a window drag sends a burst). Returns false when
+ * there is none, it is too fresh, or it equals the layout being served. */
+bool     rdp_peer_take_pending_layout(freerdp_peer *peer, RDPMonitorLayout *out,
+                                      uint32_t debounceMs);
+
 /*
- * Send an AVC420 (H.264) frame.
+ * Send an AVC420 (H.264) frame for one monitor's surface.
  *
- * The H.264 bitstream always encodes the full surface (VideoToolbox encodes
- * the whole IOSurface), so the surface-command destination is always the full
- * surface. The damage region is signalled via the AVC420 metablock regionRects:
- *   - keyframe  -> region = full surface (entire picture is fresh)
- *   - interframe-> region = dirty rect   (only changed pixels need compositing)
+ * epoch is the value rdp_peer_set_layout() returned for the layout this frame
+ * was encoded for; a stale epoch or an out-of-range monitorIndex drops the frame
+ * (returns true: not an error). width/height are the encoded picture size, which
+ * must equal the monitor's.
  *
- * A valid quantQualityVals array (one entry per region) is ALWAYS supplied —
- * the FreeRDP server serializer dereferences it unconditionally, so a NULL
- * here is a guaranteed crash on the first frame.
- *
- * dirtyX/Y/W/H are in surface pixels; ignored when isKeyFrame is true.
+ * The H.264 bitstream always encodes the full surface, so the surface-command
+ * destination is the full surface. The damage region goes in the AVC420
+ * metablock regionRects: keyframe -> full surface, interframe -> dirty rect
+ * (surface pixels; ignored for keyframes). A valid quantQualityVals array is
+ * always supplied - FreeRDP's serializer dereferences it unconditionally.
  */
 bool rdp_peer_send_h264_frame(freerdp_peer *peer,
+                               uint32_t epoch, uint32_t monitorIndex,
                                const uint8_t *data, size_t len,
                                uint32_t width, uint32_t height,
                                bool isKeyFrame,

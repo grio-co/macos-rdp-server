@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <time.h>
 
 /* ── MS-RDPEFS (rdpdr) protocol constants ──────────────────────────────── */
 /* Packet ids from MS-RDPEFS specification §2.2.1.1 */
@@ -117,6 +118,68 @@ typedef enum {
 /* Load the server certificate + private key into the peer settings. Without
  * these, the TLS handshake cannot complete and the client aborts with a
  * connection/security error (mstsc 0x904). Returns false if either is missing. */
+/* ── Monitor layout helpers ────────────────────────────────────────────── */
+
+/* MS-RDPEDISP 2.2.2.2.1 monitor bounds; GFX surfaces and desktops are UINT16. */
+#define RDP_MON_MIN 200
+#define RDP_MON_MAX 8192
+#define RDP_DESKTOP_MAX 32766
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+bool rdp_layout_normalize(RDPMonitorLayout *l) {
+    if (!l || l->count == 0 || l->count > RDP_MAX_MONITORS) return false;
+    int32_t minX = INT32_MAX, minY = INT32_MAX;
+    int primary = -1;
+    for (uint32_t i = 0; i < l->count; i++) {
+        RDPMonitor *m = &l->monitors[i];
+        m->width  = clamp_u32(m->width,  RDP_MON_MIN, RDP_MON_MAX) & ~1u;
+        m->height = clamp_u32(m->height, RDP_MON_MIN, RDP_MON_MAX);
+        if (m->scale < 100 || m->scale > 500) m->scale = 100;
+        if (m->primary) {
+            if (primary < 0) primary = (int)i;
+            else m->primary = false;            /* exactly one primary */
+        }
+        if (m->x < minX) minX = m->x;
+        if (m->y < minY) minY = m->y;
+    }
+    if (primary < 0) l->monitors[0].primary = true;
+    uint32_t w = 0, h = 0;
+    for (uint32_t i = 0; i < l->count; i++) {
+        RDPMonitor *m = &l->monitors[i];
+        m->x -= minX;                            /* bounding box starts at (0,0) */
+        m->y -= minY;
+        if ((uint32_t)m->x + m->width  > w) w = (uint32_t)m->x + m->width;
+        if ((uint32_t)m->y + m->height > h) h = (uint32_t)m->y + m->height;
+    }
+    if (w > RDP_DESKTOP_MAX || h > RDP_DESKTOP_MAX) return false;
+    l->desktopWidth  = w;
+    l->desktopHeight = h;
+    return true;
+}
+
+bool rdp_layout_equal(const RDPMonitorLayout *a, const RDPMonitorLayout *b) {
+    if (a->count != b->count) return false;
+    for (uint32_t i = 0; i < a->count; i++) {
+        const RDPMonitor *p = &a->monitors[i], *q = &b->monitors[i];
+        if (p->x != q->x || p->y != q->y || p->width != q->width ||
+            p->height != q->height || p->scale != q->scale ||
+            p->primary != q->primary ||
+            p->physicalWidthMm != q->physicalWidthMm ||
+            p->physicalHeightMm != q->physicalHeightMm)
+            return false;
+    }
+    return true;
+}
+
 static bool peer_load_certificate(freerdp_peer *peer) {
     rdpSettings *s = peer->context->settings;
 
@@ -283,6 +346,83 @@ static BOOL peer_focus_in(rdpInput *input, UINT16 toggleStates) {
 
 /* ── GFX caps negotiation ──────────────────────────────────────────────── */
 
+/* (Re)builds the client's graphics output for ctx->layout: deletes the old
+ * surfaces, sends ResetGraphics (desktop size + monitor list), then one
+ * CreateSurface + MapSurfaceToOutput per monitor. Every new surface has a fresh
+ * H.264 decoder on the client, so each waits for a keyframe.
+ *
+ * ResetGraphics history: an earlier attempt left width/height at 0, and mstsc
+ * dropped the connection right after it — a 0x0 output buffer is invalid. The
+ * PDU is sent the way Windows, xrdp and FreeRDP's shadow server send it: real
+ * desktop size, monitors in desktop (bounding-box) coordinates, right/bottom
+ * inclusive, primary flagged. RDP_GFX_RESET=0 restores the old single-surface,
+ * no-reset behaviour as an escape hatch.
+ *
+ * Caller holds xportLock; requires gfxReady && layoutSet. */
+static void gfx_rebuild_surfaces_locked(RDPPeerContext *ctx) {
+    RdpgfxServerContext *gfx = ctx->gfx;
+    const RDPMonitorLayout *l = &ctx->layout;
+
+    for (uint32_t i = 0; i < ctx->surfaceCount; i++) {
+        RDPGFX_DELETE_SURFACE_PDU ds = { .surfaceId = ctx->surfaceIds[i] };
+        (void)gfx->DeleteSurface(gfx, &ds);
+    }
+    ctx->surfaceCount = 0;
+
+    if (!ctx->legacyGfx) {
+        MONITOR_DEF defs[RDP_MAX_MONITORS];
+        for (uint32_t i = 0; i < l->count; i++) {
+            const RDPMonitor *m = &l->monitors[i];
+            defs[i].left   = m->x;
+            defs[i].top    = m->y;
+            defs[i].right  = m->x + (int32_t)m->width  - 1;
+            defs[i].bottom = m->y + (int32_t)m->height - 1;
+            defs[i].flags  = m->primary ? MONITOR_PRIMARY : 0;
+        }
+        RDPGFX_RESET_GRAPHICS_PDU rg = {
+            .width = l->desktopWidth, .height = l->desktopHeight,
+            .monitorCount = l->count, .monitorDefArray = defs,
+        };
+        UINT rc = gfx->ResetGraphics(gfx, &rg);
+        if (rc != CHANNEL_RC_OK)
+            rdp_error("ResetGraphics %ux%u (%u monitors) failed: %u",
+                      l->desktopWidth, l->desktopHeight, l->count, rc);
+    }
+
+    for (uint32_t i = 0; i < l->count; i++) {
+        const RDPMonitor *m = &l->monitors[i];
+        uint16_t sid = ctx->nextSurfaceId++;
+        if (ctx->nextSurfaceId == 0) ctx->nextSurfaceId = 1;
+
+        RDPGFX_CREATE_SURFACE_PDU cs = {
+            .surfaceId = sid, .width = (UINT16)m->width, .height = (UINT16)m->height,
+            .pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888,
+        };
+        UINT rc = gfx->CreateSurface(gfx, &cs);
+        RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU ms = {
+            .surfaceId = sid, .outputOriginX = (UINT32)m->x, .outputOriginY = (UINT32)m->y,
+        };
+        if (rc == CHANNEL_RC_OK) rc = gfx->MapSurfaceToOutput(gfx, &ms);
+        if (rc != CHANNEL_RC_OK)
+            rdp_error("GFX surface %u for monitor %u failed: %u", sid, i, rc);
+
+        ctx->surfaceIds[i]               = sid;
+        ctx->surfaceKeyframeSent[i]      = false;
+        ctx->surfaceKeyframeRequested[i] = true;
+        rdp_verbose("GFX surface %u -> monitor %u: %ux%u at (%d,%d)%s",
+                    sid, i, m->width, m->height, m->x, m->y,
+                    m->primary ? " primary" : "");
+    }
+    ctx->surfaceCount = l->count;
+
+    if (ctx->callbacks.onKeyframeRequest)
+        ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata, -1);
+    rdp_info("GFX output ready: %ux%u desktop, %u monitor(s), AVC420%s",
+             l->desktopWidth, l->desktopHeight, l->count,
+             ctx->legacyGfx ? " (legacy: no ResetGraphics)" : "");
+}
+
+
 static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
                                 const RDPGFX_CAPS_ADVERTISE_PDU *pdu) {
     RDPPeerContext *ctx = (RDPPeerContext *)gfx->custom;
@@ -322,75 +462,76 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
     UINT rc = gfx->CapsConfirm(gfx, &confirm);
     if (rc != CHANNEL_RC_OK) { rdp_error("CapsConfirm failed: %u", rc); return rc; }
 
-    rdpSettings *s = ctx->base.peer->context->settings;
-    UINT32 w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
-    UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
-
-    /* NOTE: we deliberately do NOT send RDPGFX_RESET_GRAPHICS. Field testing showed
-     * mstsc resets the connection ~10ms after receiving our RESET_GRAPHICS PDU
-     * (before any surface frame), whereas without it the session is stable. The
-     * surface is created at the full desktop size and mapped to output origin (0,0),
-     * which mstsc composites against the negotiated desktop dimensions directly.
-     * (The earlier black screen was the P-frame-before-keyframe bug, since fixed,
-     * not a missing canvas.) If multi-monitor support is added later, RESET_GRAPHICS
-     * will be needed — but the MONITOR_DEF format must be validated against mstsc. */
-
-    RDPGFX_CREATE_SURFACE_PDU cs = {0};
-    cs.surfaceId   = ctx->surfaceId;
-    cs.width       = (UINT16)w;
-    cs.height      = (UINT16)h;
-    cs.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
-    gfx->CreateSurface(gfx, &cs);
-
-    RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU ms = {0};
-    ms.surfaceId     = ctx->surfaceId;
-    ms.outputOriginX = 0;
-    ms.outputOriginY = 0;
-    gfx->MapSurfaceToOutput(gfx, &ms);
-
     ctx->gfxReady = true;
-    /* Any frames encoded during GFX setup were dropped ("gfx not ready"), so demand
-     * a fresh IDR — the first frame the client decodes must be a keyframe. */
-    ctx->sentKeyframe = false;
-    if (ctx->callbacks.onKeyframeRequest) {
-        ctx->keyframeRequested = true;
-        ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
-    }
-    rdp_info("GFX pipeline ready (%ux%u AVC420)", w, h);
+    if (ctx->layoutSet)
+        gfx_rebuild_surfaces_locked(ctx);
+    else
+        rdp_info("GFX caps confirmed; surfaces follow once the session sets its layout");
     return CHANNEL_RC_OK;
 }
 
 /* ── MS-RDPEDISP (DISPLAY_CONTROL) ─────────────────────────────────────── */
 
-/* The client asked us to change resolution / monitor layout (MS-RDPEDISP
- * 2.2.2.2), e.g. because its window was resized or it went full-screen.
- *
- * OBSERVE-ONLY, deliberately. Honouring a resize means recreating the virtual
- * display, capture and encoder at the new size, then telling the client via
- * RDPGFX_RESET_GRAPHICS + a new surface. RESET_GRAPHICS is the problem: field
- * testing found mstsc drops the connection ~10ms after receiving ours (see the
- * note in gfx_caps_advertise), so wiring the resize on top of it today would
- * trade "resize does nothing" for "resize kills the session" — strictly worse.
- *
- * Logging the request is still worth landing: it proves whether the client
- * negotiates the channel and what geometry it asks for, which is the missing
- * evidence needed to attack the RESET_GRAPHICS bug. */
+/* The client asks for a new layout (MS-RDPEDISP 2.2.2.2): its window was
+ * resized, it went full screen, or its monitors changed. Runs on FreeRDP's disp
+ * thread, so it only records the request; the session loop applies it after a
+ * debounce (rdp_peer_take_pending_layout). */
 static UINT disp_monitor_layout(DispServerContext *context,
                                 const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu) {
     RDPPeerContext *ctx = (RDPPeerContext *)context->custom;
-    if (!pdu) return CHANNEL_RC_OK;
+    if (!pdu || pdu->NumMonitors == 0) return CHANNEL_RC_OK;
+    if (pdu->NumMonitors > RDP_MAX_MONITORS) {
+        rdp_error("disp: %u monitors requested, at most %u supported — ignored",
+                  pdu->NumMonitors, RDP_MAX_MONITORS);
+        return CHANNEL_RC_OK;
+    }
 
+    RDPMonitorLayout l = { .count = pdu->NumMonitors };
     for (UINT32 i = 0; i < pdu->NumMonitors; i++) {
         const DISPLAY_CONTROL_MONITOR_LAYOUT *m = &pdu->Monitors[i];
-        rdp_info("disp: client requested monitor %u/%u %ux%u at (%d,%d) "
-                 "scale=%u%% orientation=%u%s — NOT applied (dynamic resize "
-                 "needs RESET_GRAPHICS; see disp_monitor_layout)",
-                 i + 1, pdu->NumMonitors, m->Width, m->Height, m->Left, m->Top,
-                 m->DesktopScaleFactor, m->Orientation,
-                 (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) ? " primary" : "");
+        l.monitors[i] = (RDPMonitor){
+            .x = m->Left, .y = m->Top, .width = m->Width, .height = m->Height,
+            .scale = m->DesktopScaleFactor,
+            .physicalWidthMm = m->PhysicalWidth, .physicalHeightMm = m->PhysicalHeight,
+            .primary = (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) != 0,
+        };
+        rdp_verbose("disp: monitor %u/%u %ux%u at (%d,%d) scale=%u%%%s",
+                    i + 1, pdu->NumMonitors, m->Width, m->Height, m->Left, m->Top,
+                    m->DesktopScaleFactor,
+                    (m->Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) ? " primary" : "");
     }
-    (void)ctx;
+    if (!rdp_layout_normalize(&l)) {
+        rdp_error("disp: unusable layout requested — ignored");
+        return CHANNEL_RC_OK;
+    }
+
+    pthread_mutex_lock(&ctx->xportLock);
+    ctx->pendingLayout       = l;
+    ctx->pendingLayoutValid  = true;
+    ctx->pendingLayoutTimeMs = mono_ms();
+    pthread_mutex_unlock(&ctx->xportLock);
+    rdp_info("disp: client requested %u monitor(s), desktop %ux%u",
+             l.count, l.desktopWidth, l.desktopHeight);
     return CHANNEL_RC_OK;
+}
+
+static BOOL disp_channel_id_assigned(DispServerContext *context, UINT32 channelId) {
+    ((RDPPeerContext *)context->custom)->dispChannelId = channelId;
+    return TRUE;
+}
+
+/* The client answered a DVC Create Request. For DISP, success means we may now
+ * send our caps (max monitors / area), which is what makes the client start
+ * sending layouts. Runs inside the VCM pump (run loop, xportLock held): only
+ * flag it; the run loop sends after the pump. */
+static BOOL dvc_creation_status(void *userdata, UINT32 channelId, INT32 status) {
+    RDPPeerContext *ctx = (RDPPeerContext *)userdata;
+    if (ctx->disp && channelId == ctx->dispChannelId && channelId != 0) {
+        if (status >= 0) ctx->dispCapsPending = true;
+        else rdp_info("client declined the display-control channel (0x%08x) — "
+                      "dynamic resolution unavailable", (unsigned)status);
+    }
+    return TRUE;
 }
 
 /* ── Clipboard callbacks ───────────────────────────────────────────────── */
@@ -723,7 +864,14 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     if (!ctx->gfx) { rdp_error("rdpgfx_server_context_new failed"); return FALSE; }
     ctx->gfx->custom        = ctx;
     ctx->gfx->CapsAdvertise = gfx_caps_advertise;
-    ctx->surfaceId          = 1;
+    ctx->nextSurfaceId      = 1;
+    {
+        const char *gr = getenv("RDP_GFX_RESET");
+        ctx->legacyGfx = (gr && strcmp(gr, "0") == 0);
+        if (ctx->legacyGfx)
+            rdp_info("RDP_GFX_RESET=0: legacy GFX (one surface, no ResetGraphics, "
+                     "no dynamic resolution or multi-monitor)");
+    }
     /* External-thread mode: do NOT let GFX spawn its own thread. The default
      * (ownThread=TRUE) runs an internal loop calling rdpgfx_server_handle_messages
      * — which would race our run-loop's own handle_messages call and the encoder
@@ -734,25 +882,24 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         ctx->gfx->Initialize(ctx->gfx, TRUE);
     rdp_verbose("GFX context created (external-thread mode); open deferred");
 
-    /* MS-RDPEDISP DISPLAY_CONTROL. Like GFX this is a DVC, so Open() is deferred
-     * to the run loop until drdynvc is READY. Observe-only for now — see
-     * disp_monitor_layout. */
-    ctx->disp = disp_server_context_new(ctx->vcm);
+    /* MS-RDPEDISP DISPLAY_CONTROL: lets the client resize the session (window
+     * resize, full screen, monitor changes). Like GFX it is a DVC, so Open() is
+     * deferred to the run loop until drdynvc is READY, and our caps go out once
+     * the client accepts the channel (dvc_creation_status). */
+    ctx->disp = ctx->legacyGfx ? NULL : disp_server_context_new(ctx->vcm);
     if (!ctx->disp) {
-        /* Non-fatal: without it the client just can't request resolutions, which
-         * is the status quo. Everything else still works. */
-        rdp_error("disp_server_context_new failed — dynamic resolution unavailable");
+        if (!ctx->legacyGfx)
+            rdp_error("disp_server_context_new failed — dynamic resolution unavailable");
     } else {
         ctx->disp->custom            = ctx;
         ctx->disp->rdpcontext        = peer->context;
         ctx->disp->DispMonitorLayout = disp_monitor_layout;
-        /* One monitor: multimon is advertised in settings but not implemented
-         * (no monitor layout is ever sent), so claiming more here would be
-         * another capability we can't honour. The area factors are the
-         * MS-RDPEDISP 2.2.2.1 defaults. */
-        ctx->disp->MaxNumMonitors        = 1;
+        ctx->disp->ChannelIdAssigned = disp_channel_id_assigned;
+        ctx->disp->MaxNumMonitors        = RDP_MAX_MONITORS;
+        /* MS-RDPEDISP 2.2.2.1: max area = A x B x MaxNumMonitors pixels. */
         ctx->disp->MaxMonitorAreaFactorA = 8192;
         ctx->disp->MaxMonitorAreaFactorB = 8192;
+        WTSVirtualChannelManagerSetDVCCreationCallback(ctx->vcm, dvc_creation_status, ctx);
         rdp_verbose("DISP context created; open deferred");
     }
 
@@ -872,13 +1019,16 @@ static BOOL peer_suppress_output(rdpContext *context, BYTE allow,
     (void)area;
     RDPPeerContext *ctx = (RDPPeerContext *)context;
     if (allow) {
-        ctx->outputSuppressed = false;
         /* Force a self-contained refresh so the restored window decodes. */
-        ctx->sentKeyframe = false;
-        if (ctx->callbacks.onKeyframeRequest) {
-            ctx->keyframeRequested = true;
-            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
+        pthread_mutex_lock(&ctx->xportLock);
+        ctx->outputSuppressed = false;
+        for (uint32_t i = 0; i < ctx->surfaceCount; i++) {
+            ctx->surfaceKeyframeSent[i]      = false;
+            ctx->surfaceKeyframeRequested[i] = true;
         }
+        if (ctx->callbacks.onKeyframeRequest)
+            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata, -1);
+        pthread_mutex_unlock(&ctx->xportLock);
         rdp_verbose("client output ALLOWED (restored) — forcing keyframe");
     } else {
         ctx->outputSuppressed = true;
@@ -1103,13 +1253,24 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_READY) {
         if (ctx->disp->Open(ctx->disp) == CHANNEL_RC_OK) {
             ctx->dispOpened = true;
-            rdp_info("DISP channel opened (drdynvc ready) — resolution requests "
-                     "will be logged, not applied");
+            rdp_info("DISP channel opened (drdynvc ready)");
         } else {
             rdp_error("DISP Open failed — dynamic resolution unavailable");
             /* Don't retry every 50ms for the life of the session. */
             ctx->dispOpened = true;
         }
+    }
+
+    /* The client accepted the DISP channel: advertise our limits so it starts
+     * sending monitor layouts. Without this PDU it never does. */
+    if (ok && ctx->disp && ctx->dispCapsPending) {
+        ctx->dispCapsPending = false;
+        UINT rc = ctx->disp->DisplayControlCaps(ctx->disp);
+        if (rc == CHANNEL_RC_OK)
+            rdp_info("DISP caps sent: up to %u monitors — dynamic resolution on",
+                     RDP_MAX_MONITORS);
+        else
+            rdp_error("DISP caps send failed: %u", rc);
     }
 
     /* Drain GFX channel messages once the channel is open. */
@@ -1169,58 +1330,182 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
     return ok;
 }
 
+/* ── Display layout API ────────────────────────────────────────────────── */
+
+void rdp_peer_get_client_layout(freerdp_peer *peer, RDPMonitorLayout *out) {
+    rdpSettings *s = peer->context->settings;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    memset(out, 0, sizeof(*out));
+
+    UINT32 globalScale = freerdp_settings_get_uint32(s, FreeRDP_DesktopScaleFactor);
+    UINT32 n = freerdp_settings_get_uint32(s, FreeRDP_MonitorCount);
+    BOOL attrs = freerdp_settings_get_bool(s, FreeRDP_HasMonitorAttributes);
+    if (n > RDP_MAX_MONITORS) {
+        rdp_error("client has %u monitors; serving the first %u", n, RDP_MAX_MONITORS);
+        n = RDP_MAX_MONITORS;
+    }
+
+    if (n >= 1 && !ctx->legacyGfx) {
+        for (UINT32 i = 0; i < n; i++) {
+            const rdpMonitor *m = freerdp_settings_get_pointer_array(
+                s, FreeRDP_MonitorDefArray, i);
+            if (!m) { n = i; break; }
+            out->monitors[i] = (RDPMonitor){
+                .x = m->x, .y = m->y,
+                .width = (uint32_t)(m->width  > 0 ? m->width  : 0),
+                .height = (uint32_t)(m->height > 0 ? m->height : 0),
+                .scale = (attrs && m->attributes.desktopScaleFactor)
+                             ? m->attributes.desktopScaleFactor : globalScale,
+                .physicalWidthMm  = attrs ? m->attributes.physicalWidth  : 0,
+                .physicalHeightMm = attrs ? m->attributes.physicalHeight : 0,
+                .primary = m->is_primary != 0,
+            };
+        }
+        out->count = n;
+    }
+    if (out->count == 0) {
+        out->count = 1;
+        out->monitors[0] = (RDPMonitor){
+            .width  = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth),
+            .height = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight),
+            .scale  = globalScale,
+            .physicalWidthMm  = freerdp_settings_get_uint32(s, FreeRDP_DesktopPhysicalWidth),
+            .physicalHeightMm = freerdp_settings_get_uint32(s, FreeRDP_DesktopPhysicalHeight),
+            .primary = true,
+        };
+    }
+    if (!rdp_layout_normalize(out)) {
+        /* Degenerate input: fall back to one sane monitor. */
+        memset(out, 0, sizeof(*out));
+        out->count = 1;
+        out->monitors[0] = (RDPMonitor){ .width = 1920, .height = 1080, .scale = 100,
+                                         .primary = true };
+        rdp_layout_normalize(out);
+    }
+}
+
+uint32_t rdp_peer_set_layout(freerdp_peer *peer, const RDPMonitorLayout *layout) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    RDPMonitorLayout l = *layout;
+    if (!rdp_layout_normalize(&l)) {
+        rdp_error("rdp_peer_set_layout: invalid layout ignored");
+        pthread_mutex_lock(&ctx->xportLock);
+        uint32_t e = ctx->layoutEpoch;
+        pthread_mutex_unlock(&ctx->xportLock);
+        return e;
+    }
+
+    pthread_mutex_lock(&ctx->xportLock);
+    ctx->layout    = l;
+    ctx->layoutSet = true;
+    uint32_t epoch = ++ctx->layoutEpoch;
+    /* A request identical to what we now serve is satisfied. */
+    if (ctx->pendingLayoutValid && rdp_layout_equal(&ctx->pendingLayout, &l))
+        ctx->pendingLayoutValid = false;
+    rdpSettings *s = peer->context->settings;
+    freerdp_settings_set_uint32(s, FreeRDP_DesktopWidth,  l.desktopWidth);
+    freerdp_settings_set_uint32(s, FreeRDP_DesktopHeight, l.desktopHeight);
+    if (ctx->gfx && ctx->gfxReady)
+        gfx_rebuild_surfaces_locked(ctx);
+    else
+        ctx->surfaceCount = 0;   /* built when the client's GFX caps arrive */
+    pthread_mutex_unlock(&ctx->xportLock);
+    return epoch;
+}
+
+bool rdp_peer_take_pending_layout(freerdp_peer *peer, RDPMonitorLayout *out,
+                                  uint32_t debounceMs) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    bool got = false;
+    pthread_mutex_lock(&ctx->xportLock);
+    if (ctx->pendingLayoutValid &&
+        mono_ms() - ctx->pendingLayoutTimeMs >= debounceMs) {
+        ctx->pendingLayoutValid = false;
+        if (!ctx->layoutSet || !rdp_layout_equal(&ctx->pendingLayout, &ctx->layout)) {
+            *out = ctx->pendingLayout;
+            got = true;
+        }
+    }
+    pthread_mutex_unlock(&ctx->xportLock);
+    return got;
+}
+
 bool rdp_peer_send_h264_frame(freerdp_peer *peer,
+                               uint32_t epoch, uint32_t monitorIndex,
                                const uint8_t *data, size_t len,
                                uint32_t width, uint32_t height,
                                bool isKeyFrame,
                                uint16_t dirtyX, uint16_t dirtyY,
                                uint16_t dirtyW, uint16_t dirtyH) {
+    if (!peer) return false;
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->gfxReady || !ctx->gfx) { rdp_debug("gfx not ready"); return false; }
+
+    /* Everything below reads layout/surface state that the run loop and the
+     * session thread change, and ends in a transport write: hold the lock. */
+    pthread_mutex_lock(&ctx->xportLock);
+    bool ok = true;
+
+    if (!ctx->gfx || !ctx->gfxReady || ctx->surfaceCount == 0) {
+        rdp_debug("gfx not ready");
+        goto out;
+    }
+    /* Encoded for a layout we no longer serve, or for a monitor that is gone:
+     * its surface no longer exists on the client. */
+    if (epoch != ctx->layoutEpoch || monitorIndex >= ctx->surfaceCount) goto out;
+    {
+        const RDPMonitor *mon = &ctx->layout.monitors[monitorIndex];
+        if (width != mon->width || height != mon->height) {
+            rdp_debug("frame %ux%u does not match monitor %u (%ux%u) — dropped",
+                      width, height, monitorIndex, mon->width, mon->height);
+            goto out;
+        }
+    }
 
     /* Client minimized: it ignores (and may choke on) graphics while output is
-     * suppressed. Drop frames until it restores (which forces a fresh keyframe). */
-    if (ctx->outputSuppressed) return true;
+     * suppressed. Drop frames until it restores (which forces fresh keyframes). */
+    if (ctx->outputSuppressed) goto out;
 
-    /* The first frame the client receives MUST be a self-contained keyframe.
-     * Frames encoded while the GFX channel was still opening were discarded, so a
-     * delta sent now references frames the client never got -> undecodable (black).
-     * Drop deltas until a keyframe goes out, asking the encoder to emit one. */
-    if (!ctx->sentKeyframe && !isKeyFrame) {
-        if (!ctx->keyframeRequested && ctx->callbacks.onKeyframeRequest) {
-            ctx->keyframeRequested = true;
-            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
-            rdp_debug("delta before first keyframe — requested IDR, dropping");
+    /* Each surface's first frame MUST be a self-contained keyframe: a delta would
+     * reference pictures that surface's decoder never got (black / decode error).
+     * Drop deltas until a keyframe goes out, asking that encoder for one. */
+    if (!ctx->surfaceKeyframeSent[monitorIndex] && !isKeyFrame) {
+        if (!ctx->surfaceKeyframeRequested[monitorIndex] &&
+            ctx->callbacks.onKeyframeRequest) {
+            ctx->surfaceKeyframeRequested[monitorIndex] = true;
+            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata,
+                                             (int32_t)monitorIndex);
+            rdp_debug("delta before first keyframe on monitor %u — requested IDR",
+                      monitorIndex);
         }
-        return true;
+        goto out;
     }
-    if (isKeyFrame) { ctx->sentKeyframe = true; ctx->keyframeRequested = false; }
+    if (isKeyFrame) {
+        ctx->surfaceKeyframeSent[monitorIndex]      = true;
+        ctx->surfaceKeyframeRequested[monitorIndex] = false;
+    }
 
-    /* Build the damage region. Keyframes refresh the whole surface, so they
-     * must claim the full extent; inter-frames claim only the dirty rect.
-     * Align to 16px macroblock boundaries and clamp to surface bounds — the
-     * AVC420 region must lie within the decoded picture or the client rejects it. */
+    /* Damage region: keyframes refresh the whole surface; deltas claim only the
+     * dirty rect, aligned to 16px macroblocks and clamped to the surface (an
+     * AVC420 region outside the decoded picture is rejected by the client). */
     RECTANGLE_16 rect;
     if (isKeyFrame || dirtyW == 0 || dirtyH == 0) {
         rect.left = 0; rect.top = 0;
         rect.right = (UINT16)width; rect.bottom = (UINT16)height;
     } else {
-        uint32_t left   = dirtyX & ~15u;                 /* round down to 16 */
+        uint32_t left   = dirtyX & ~15u;
         uint32_t top    = dirtyY & ~15u;
-        uint32_t right  = (dirtyX + dirtyW + 15u) & ~15u; /* round up to 16 */
-        uint32_t bottom = (dirtyY + dirtyH + 15u) & ~15u;
+        uint32_t right  = ((uint32_t)dirtyX + dirtyW + 15u) & ~15u;
+        uint32_t bottom = ((uint32_t)dirtyY + dirtyH + 15u) & ~15u;
         if (right  > width)  right  = width;
         if (bottom > height) bottom = height;
-        if (left   >= right)  { left = 0; right = (uint32_t)width; }
-        if (top    >= bottom) { top = 0;  bottom = (uint32_t)height; }
-        rect.left = (UINT16)left;  rect.top = (UINT16)top;
+        if (left   >= right)  { left = 0; right = width; }
+        if (top    >= bottom) { top = 0;  bottom = height; }
+        rect.left = (UINT16)left;   rect.top = (UINT16)top;
         rect.right = (UINT16)right; rect.bottom = (UINT16)bottom;
     }
 
-    /* quantQualityVals MUST be a valid parallel array — the server serializer
-     * dereferences quantQualityVals[i] for every region rect. NULL crashes.
-     * qp is a quality hint (QoE only, not decode-critical); qualityVal mirrors
-     * FreeRDP's own encoder: 100 - (qp & 0x3F). */
+    /* quantQualityVals MUST be a valid parallel array (NULL crashes the
+     * serializer). qp is a QoE hint; qualityVal mirrors FreeRDP's encoder. */
     RDPGFX_H264_QUANT_QUALITY quant = {0};
     quant.qp         = 26;
     quant.qualityVal = (BYTE)(100 - (26 & 0x3F));
@@ -1232,13 +1517,10 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     avc.meta.regionRects      = &rect;
     avc.meta.quantQualityVals = &quant;
 
-    /* The H.264 picture is full-surface, so the destination extent is too. */
     RDPGFX_SURFACE_COMMAND cmd = {0};
-    cmd.surfaceId = ctx->surfaceId;
+    cmd.surfaceId = ctx->surfaceIds[monitorIndex];
     cmd.codecId   = RDPGFX_CODECID_AVC420;
-    /* cmd.format is a FreeRDP COLOR format (color.h), not a GFX wire enum.
-     * rdpgfx_write_surface_command only accepts BGRX32/BGRA32 (-> XRGB/ARGB
-     * on the wire). Using the wire enum yields "Format UNKNOWN not supported". */
+    /* cmd.format is a FreeRDP COLOR format (color.h), not a GFX wire enum. */
     cmd.format    = PIXEL_FORMAT_BGRX32;
     cmd.right     = (UINT16)width;
     cmd.bottom    = (UINT16)height;
@@ -1246,24 +1528,24 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     cmd.data      = (BYTE *)data;
     cmd.extra     = &avc;
 
-    /* Wrap the surface command in StartFrame/EndFrame markers, like the shadow
-     * server. mstsc needs the frame boundaries (and frameId) to composite the
-     * decoded surface to the display — bare SurfaceCommands often don't render. */
+    /* StartFrame/EndFrame bracket every surface command: mstsc composites on
+     * EndFrame, and frame ids drive its acknowledgements. */
     uint32_t fid = ++ctx->frameId;
-    RDPGFX_START_FRAME_PDU startFrame = {0};
-    startFrame.frameId = fid;
-    RDPGFX_END_FRAME_PDU endFrame = {0};
-    endFrame.frameId = fid;
+    RDPGFX_START_FRAME_PDU startFrame = { .frameId = fid };
+    RDPGFX_END_FRAME_PDU   endFrame   = { .frameId = fid };
 
-    /* Serialize against ALL other transport writers (run loop, cliprdr, audio). */
-    pthread_mutex_lock(&ctx->xportLock);
     UINT rc = ctx->gfx->SurfaceFrameCommand(ctx->gfx, &cmd, &startFrame, &endFrame);
-    pthread_mutex_unlock(&ctx->xportLock);
-    if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceFrameCommand failed: %u", rc); return false; }
-    rdp_debug("sent %s frame: region=(%u,%u)-(%u,%u) len=%zu",
-              isKeyFrame ? "key" : "delta",
+    if (rc != CHANNEL_RC_OK) {
+        rdp_error("SurfaceFrameCommand failed: %u", rc);
+        ok = false;
+        goto out;
+    }
+    rdp_debug("sent %s frame: monitor %u region=(%u,%u)-(%u,%u) len=%zu",
+              isKeyFrame ? "key" : "delta", monitorIndex,
               rect.left, rect.top, rect.right, rect.bottom, len);
-    return true;
+out:
+    pthread_mutex_unlock(&ctx->xportLock);
+    return ok;
 }
 
 void rdp_peer_send_default_cursor(freerdp_peer *peer) {

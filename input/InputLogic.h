@@ -104,3 +104,40 @@ static inline int il_click_down(ILClickTracker *t, int button, double now,
     t->button = button; t->time = now; t->x = x; t->y = y;
     return t->count;
 }
+
+/* ── Multi-monitor pointer mapping ────────────────────────────────────────
+ * RDP pointer coordinates are in the client's desktop space (client pixels,
+ * origin at the top-left of all its monitors). Each monitor is served by its
+ * own Mac display, whose global rect is in points (smaller than the monitor's
+ * pixels when HiDPI). */
+typedef struct { double x, y, w, h; } ILRect;
+
+/* Monitor containing (x,y), else the nearest one (pointer in a gap between
+ * monitors, or on an edge pixel the client still reports). */
+static inline int il_monitor_at(const ILRect *mons, int n, double x, double y) {
+    int best = 0;
+    double bestD = INFINITY;
+    for (int i = 0; i < n; i++) {
+        const ILRect *m = &mons[i];
+        double dx = x < m->x ? m->x - x : (x >= m->x + m->w ? x - (m->x + m->w) + 1 : 0);
+        double dy = y < m->y ? m->y - y : (y >= m->y + m->h ? y - (m->y + m->h) + 1 : 0);
+        double d = dx * dx + dy * dy;
+        if (d == 0) return i;
+        if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
+/* Maps desktop pixel (x,y) of monitor `m` to a point inside display rect `g`,
+ * using pixel centres and staying strictly inside the display (its right and
+ * bottom edges belong to the neighbouring display). */
+static inline void il_map_into(ILRect m, ILRect g, double x, double y,
+                               double *ox, double *oy) {
+    double fx = m.w > 0 ? (x - m.x + 0.5) / m.w : 0;
+    double fy = m.h > 0 ? (y - m.y + 0.5) / m.h : 0;
+    double px = fx * g.w, py = fy * g.h;
+    if (px < 0) px = 0; else if (px > g.w - 0.01) px = g.w - 0.01;
+    if (py < 0) py = 0; else if (py > g.h - 0.01) py = g.h - 0.01;
+    *ox = g.x + px;
+    *oy = g.y + py;
+}

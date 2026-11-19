@@ -111,6 +111,9 @@ enum { kBtnLeft = 0, kBtnRight = 1, kBtnMiddle = 2, kBtnBack = 3, kBtnForward = 
     CGPoint _lastPos;
     NSMutableIndexSet *_heldKeys;  /* non-modifier VKs currently down */
     io_connect_t _hid;             /* IOHIDSystem connection for Caps Lock */
+    ILRect _monRects[16];          /* multi-monitor map (desktop coords) */
+    CGDirectDisplayID _monDisplays[16];
+    uint32_t _monCount;
 }
 @property (nonatomic, assign) CGDirectDisplayID displayID;
 @property (nonatomic, assign) uint32_t srcW;   /* RDP desktop width  (pointer coord space) */
@@ -137,7 +140,9 @@ enum { kBtnLeft = 0, kBtnRight = 1, kBtnMiddle = 2, kBtnBack = 3, kBtnForward = 
         /* Prompt for Accessibility (required for CGEventPost) and register the
          * binary in the Privacy list. In the GUI session this pops the system
          * dialog the first time; thereafter it just reports the trust state. */
-        NSDictionary *opts = @{ (__bridge id)kAXTrustedCheckOptionPrompt: @YES };
+        const char *np = getenv("RDP_NO_TCC_PROMPT");   /* headless/test runs */
+        BOOL prompt = !(np && strcmp(np, "1") == 0);
+        NSDictionary *opts = @{ (__bridge id)kAXTrustedCheckOptionPrompt: @(prompt) };
         if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts))
             rdp_error("Accessibility not granted — input injection will not work "
                       "until enabled (grant the prompt or System Settings > Privacy "
@@ -281,7 +286,36 @@ enum { kBtnLeft = 0, kBtnRight = 1, kBtnMiddle = 2, kBtnBack = 3, kBtnForward = 
 
 /* ── Mouse ────────────────────────────────────────────────────────────── */
 
+- (void)setMonitorRects:(const CGRect *)rects
+               displays:(const CGDirectDisplayID *)displays
+                  count:(uint32_t)count {
+    _monCount = MIN(count, 16u);
+    for (uint32_t i = 0; i < _monCount; i++) {
+        _monRects[i] = (ILRect){ rects[i].origin.x, rects[i].origin.y,
+                                 rects[i].size.width, rects[i].size.height };
+        _monDisplays[i] = displays[i];
+    }
+}
+
+- (void)setSingleDisplay:(CGDirectDisplayID)displayID
+             sourceWidth:(uint32_t)sourceWidth
+            sourceHeight:(uint32_t)sourceHeight {
+    _monCount = 0;
+    self.displayID = displayID;
+    self.srcW = sourceWidth;
+    self.srcH = sourceHeight;
+}
+
 - (CGPoint)globalPointForDesktopX:(uint16_t)x y:(uint16_t)y {
+    if (_monCount > 0) {
+        int i = il_monitor_at(_monRects, (int)_monCount, x, y);
+        CGRect b = CGDisplayBounds(_monDisplays[i]);
+        double gx, gy;
+        il_map_into(_monRects[i],
+                    (ILRect){ b.origin.x, b.origin.y, b.size.width, b.size.height },
+                    x, y, &gx, &gy);
+        return CGPointMake(gx, gy);
+    }
     /* The client sends pointer coords in the RDP desktop space (0..srcW, 0..srcH).
      * The capture preserves the Mac's aspect ratio inside that surface, so the Mac
      * image occupies a CENTERED sub-rectangle with letterbox/pillarbox bars when the

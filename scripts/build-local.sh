@@ -100,6 +100,7 @@ else
 fi
 
 # ── 2. Daemon (static link) ──────────────────────────────────────────────────
+mkdir -p "$OUT"
 echo "==> Building macos-rdp-daemon ($ARCHS)"
 cmake -S "$ROOT" -B "$OUT" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \

@@ -19,6 +19,12 @@ NS_ASSUME_NONNULL_BEGIN
 #define RDP_PTR_HWHEEL            0x0400
 #define RDP_PTR_WHEEL_NEGATIVE    0x0100
 #define RDP_PTR_WHEEL_ROTATION    0x01FF
+/* Extended pointer flags (PTR_XFLAGS_*) */
+#define RDP_XFLAGS_DOWN           0x8000
+#define RDP_XFLAGS_BUTTON1        0x0001   /* back    */
+#define RDP_XFLAGS_BUTTON2        0x0002   /* forward */
+/* Keyboard "key was already down" (autorepeat) */
+#define RDP_KBD_DOWN              0x4000
 
 @interface InputInjector : NSObject
 
@@ -35,8 +41,16 @@ NS_ASSUME_NONNULL_BEGIN
  * posted once the low surrogate arrives. */
 - (void)injectUnicodeKeyEvent:(uint16_t)flags code:(uint16_t)code;
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
+/* Extended mouse (X buttons: back/forward) — PTR_XFLAGS_* in flags. */
+- (void)injectMouseExEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
 /* Wheel rotation is encoded entirely within flags; decoded internally. */
 - (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
+/* Make the Mac's Caps Lock match the client (KBD_SYNC_* flags). */
+- (void)synchronizeLockKeys:(uint32_t)flags;
+/* The single place RDP desktop coordinates are mapped to global Mac points. */
+- (CGPoint)globalPointForDesktopX:(uint16_t)x y:(uint16_t)y;
+/* Post key-up / button-up for everything still held (call on session end). */
+- (void)releaseAll;
 
 @end
 

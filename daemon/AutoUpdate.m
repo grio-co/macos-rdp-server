@@ -5,8 +5,8 @@
 #import <unistd.h>
 #import <stdlib.h>
 #import <sys/stat.h>
-#import <Security/Security.h>
 #import "daemon/UpdateVersion.h"
+#import "daemon/UpdateVerify.h"
 #define RDP_LOG_COMPONENT "update"
 #include "logging/RDPLog.h"
 
@@ -35,13 +35,7 @@
 
 /* ── Defaults ─────────────────────────────────────────────────────────── */
 #define DEF_INTERVAL_MIN   5
-#define DEF_REPO           "grioghar/macos-rdp-server"
-/* Requirement every update must satisfy: Apple-anchored Developer ID chain, our
- * team OU, and the daemon's signing identifier. Hardened runtime is checked
- * separately from the code-signature flags. */
-#define UPDATE_REQUIREMENT \
-    "anchor apple generic and certificate leaf[subject.OU] = \"FQKL8883DP\"" \
-    " and identifier \"com.macosrdp.daemon\""
+#define DEF_REPO           "grio-co/macos-rdp-server"
 #define ASSET_BIN          "macos-rdp-daemon"
 #define ASSET_SHA          "macos-rdp-daemon.sha256"
 #define NET_TIMEOUT_SEC    30.0
@@ -285,54 +279,15 @@ static NSString *bakPath(void)  { return [baseDir() stringByAppendingPathCompone
     exit(0);
 }
 
-/* ── signature verification ───────────────────────────────────────────── */
-/* Static validation (strict, all architectures) against UPDATE_REQUIREMENT,
- * plus the hardened-runtime flag. Logs the reason for any rejection. */
+/* ── signature verification (see UpdateVerify.h) ─────────────────────── */
 - (BOOL)verifySignature:(NSString *)path {
-    SecStaticCodeRef code = NULL;
-    OSStatus st = SecStaticCodeCreateWithPath(
-        (__bridge CFURLRef)[NSURL fileURLWithPath:path], kSecCSDefaultFlags, &code);
-    if (st != errSecSuccess || !code) {
-        rdp_error("verify: cannot open code at update path (OSStatus %d)", (int)st);
+    const char *why = NULL;
+    if (!update_verify_signature(path.fileSystemRepresentation, &why)) {
+        rdp_error("verify: rejected: %s", why);
         return NO;
     }
-    BOOL ok = NO;
-    SecRequirementRef req = NULL;
-    CFDictionaryRef info = NULL;
-    do {
-        st = SecRequirementCreateWithString(CFSTR(UPDATE_REQUIREMENT), kSecCSDefaultFlags, &req);
-        if (st != errSecSuccess || !req) {
-            rdp_error("verify: bad requirement string (OSStatus %d)", (int)st);
-            break;
-        }
-        SecCSFlags flags = kSecCSStrictValidate | kSecCSCheckAllArchitectures;
-        st = SecStaticCodeCheckValidity(code, flags, req);
-        if (st != errSecSuccess) {
-            const char *why = st == errSecCSReqFailed
-                ? "does not satisfy requirement (not signed by Developer ID team FQKL8883DP with identifier com.macosrdp.daemon)"
-                : st == errSecCSUnsigned ? "unsigned"
-                : st == errSecCSSignatureFailed ? "signature invalid or contents modified"
-                : "validity check failed";
-            rdp_error("verify: rejected: %s (OSStatus %d)", why, (int)st);
-            break;
-        }
-        st = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info);
-        if (st != errSecSuccess || !info) {
-            rdp_error("verify: cannot read signing information (OSStatus %d)", (int)st);
-            break;
-        }
-        NSNumber *cf = ((__bridge NSDictionary *)info)[(__bridge NSString *)kSecCodeInfoFlags];
-        if (!([cf unsignedIntValue] & kSecCodeSignatureRuntime)) {
-            rdp_error("verify: rejected: hardened runtime flag not set");
-            break;
-        }
-        ok = YES;
-    } while (0);
-    if (info) CFRelease(info);
-    if (req) CFRelease(req);
-    CFRelease(code);
-    if (ok) rdp_info("verify: Developer ID signature, identifier and hardened runtime OK");
-    return ok;
+    rdp_info("verify: Developer ID signature, identifier and hardened runtime OK");
+    return YES;
 }
 
 /* ── NSTask helper (synchronous, with timeout) ────────────────────────── */

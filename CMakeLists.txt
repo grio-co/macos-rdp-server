@@ -94,6 +94,7 @@ add_executable(macos-rdp-daemon
     daemon/SecurityPolicy.m
     daemon/DisplayControl.m
     daemon/AutoUpdate.m
+    daemon/UpdateVerify.m
     daemon/FileProvider/RDPFileProvider.m
     protocol/RDPPeer.c
     protocol/RDPClipboard.c

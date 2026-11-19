@@ -51,7 +51,8 @@ fi
 mkdir -p "$BIN_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 
 # 2. Verify the signature (never re-sign) ---------------------------------------------
-REQ='anchor apple generic and certificate leaf[subject.OU] = "FQKL8883DP" and identifier "com.macosrdp.daemon"'
+# Same requirement as daemon/UpdateVerify.h: Developer ID (not Apple Development), our team.
+REQ='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "FQKL8883DP" and identifier "com.macosrdp.daemon"'
 if ! codesign --verify --strict -R="$REQ" "$SRC" 2>/dev/null; then
     echo "Refusing to install: $SRC is not signed with the Developer ID certificate" >&2
     echo "(team FQKL8883DP, identifier com.macosrdp.daemon). Build it with scripts/build-local.sh." >&2

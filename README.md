@@ -47,7 +47,7 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 > `RDP_UPDATE_ENABLED=0` turns the updater off.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/grio-co/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 ```
 
 Downloads the latest pre-built **universal binary** (a single file that runs natively on both Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no runtime dependencies — the binary links only against macOS system frameworks.
@@ -60,13 +60,13 @@ The script will:
 
 Or download the binary directly:
 ```bash
-sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
+sudo curl -fsSL https://github.com/grio-co/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
   -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
 ```
 
 Verify the download against the published checksum:
 ```bash
-curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/SHA256SUMS | shasum -c
+curl -fsSL https://github.com/grio-co/macos-rdp-server/releases/latest/download/SHA256SUMS | shasum -c
 ```
 
 After installation, open any RDP client and connect to your Mac's IP address.
@@ -82,7 +82,7 @@ After installation, open any RDP client and connect to your Mac's IP address.
 brew install freerdp cmake openssl
 
 # 2. Clone
-git clone https://github.com/grioghar/macos-rdp-server.git
+git clone https://github.com/grio-co/macos-rdp-server.git
 cd macos-rdp-server
 
 # 3. Build & install
@@ -113,7 +113,7 @@ macOS gates the daemon's capabilities behind Privacy & Security:
 The installer opens the relevant panes automatically. To (re)run the helper:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/grant-permissions.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/grio-co/macos-rdp-server/master/scripts/grant-permissions.sh | sudo bash
 ```
 
 What it does:

@@ -171,7 +171,7 @@ option(RDP_RDPDR_ENABLED
        "Include MS-RDPEFS (rdpdr) drive-redirection channel handler"
        OFF)
 
-set(MACOS_RDP_VERSION "0.1.6")
+set(MACOS_RDP_VERSION "0.2.0")
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="${MACOS_RDP_VERSION}"
     MACOS_RDP_BUILD_VERSION="${MACOS_RDP_BUILD_VERSION}"

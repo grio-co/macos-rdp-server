@@ -11,6 +11,7 @@
 #import "daemon/AutoUpdate.h"
 #import "daemon/SecurityPolicy.h"
 #import "daemon/DisplayControl.h"
+#import "audio/AudioCapture.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
 
@@ -23,6 +24,8 @@ static int check_permissions(void) {
     BOOL access = AXIsProcessTrusted();
     fprintf(stdout, "screen_recording=%s\n", screen ? "granted" : "denied");
     fprintf(stdout, "accessibility=%s\n",    access ? "granted" : "denied");
+    /* Informational: audio is optional, so it doesn't change the exit code. */
+    fprintf(stdout, "system_audio_recording=%s\n", [AudioCapture capturePermission].UTF8String);
     return (screen && access) ? 0 : 1;
 }
 
@@ -55,7 +58,7 @@ static void print_usage(const char *prog) {
         "                        env RDP_BIND_ADDRESS)\n"
         "  --set-nla-password [user]  verify the Mac password and store its NLA (NTLM) hash, then exit\n"
         "  --clear-nla [user]    remove the stored NLA hash for the user, then exit\n"
-        "  --check-permissions   report Screen Recording + Accessibility state, then exit\n",
+        "  --check-permissions   report Screen Recording, Accessibility + System Audio Recording, then exit\n",
         prog);
 }
 

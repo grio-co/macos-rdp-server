@@ -9,6 +9,7 @@
  * client libraries by tests/integration/build-probe.sh; driven by
  * tests/integration/run-display-test.sh.
  */
+#include <unistd.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/client.h>
 #include <freerdp/client/cmdline.h>
@@ -63,6 +64,10 @@ static UINT w_map(RdpgfxClientContext *c, const RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU
  * FrameAcknowledge goes out after this callback returns), and once stalls for
  * g_stallMs after frame 30 (acks stop completely for that long). */
 static UINT32 g_slowMs, g_stallMs;
+/* --hold-ms: stay connected this long after the last step (drive tests);
+ * --hold-until: end the hold early once this file exists. */
+static UINT32 g_holdMs;
+static const char *g_holdUntil;
 static UINT w_cmd(RdpgfxClientContext *c, const RDPGFX_SURFACE_COMMAND *p) {
     g_cmds++;
     if (g_stallMs && g_cmds == 30) {
@@ -144,9 +149,11 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--expect-monitors") == 0 && i + 1 < argc) expectMonitors = (UINT32)atoi(argv[++i]);
         else if (strcmp(argv[i], "--slow-ms") == 0 && i + 1 < argc) g_slowMs = (UINT32)atoi(argv[++i]);
         else if (strcmp(argv[i], "--stall-ms") == 0 && i + 1 < argc) g_stallMs = (UINT32)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--hold-ms") == 0 && i + 1 < argc) g_holdMs = (UINT32)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--hold-until") == 0 && i + 1 < argc) g_holdUntil = argv[++i];
         else if (strcmp(argv[i], "--") == 0) { sep = i; break; }
     }
-    if (sep < 0) { fprintf(stderr, "usage: %s [--expect-monitors N] -- <client args>\n", argv[0]); return 2; }
+    if (sep < 0) { fprintf(stderr, "usage: %s [--expect-monitors N] [--hold-ms N [--hold-until FILE]] -- <client args>\n", argv[0]); return 2; }
 
     RDP_CLIENT_ENTRY_POINTS ep = { 0 };
     ep.Version = RDP_CLIENT_INTERFACE_VERSION;
@@ -224,6 +231,15 @@ int main(int argc, char **argv) {
         }
     }
     if (step < 4 && rc == 0) rc = fail("disconnected early");
+    for (uint64_t end = GetTickCount64() + g_holdMs; rc == 0 && GetTickCount64() < end &&
+         !freerdp_shall_disconnect_context(ctx);) {
+        if (g_holdUntil && access(g_holdUntil, F_OK) == 0) break;
+        HANDLE h[MAXIMUM_WAIT_OBJECTS];
+        DWORD n = freerdp_get_event_handles(ctx, h, ARRAYSIZE(h));
+        if (n == 0) { rc = fail("event handles"); break; }
+        WaitForMultipleObjects(n, h, FALSE, 100);
+        if (!freerdp_check_event_handles(ctx)) { rc = fail("connection dropped while holding"); break; }
+    }
     freerdp_disconnect(ctx->instance);
     freerdp_client_context_free(ctx);
     printf("%s (resets=%d surfaces=%d maps=%d frames=%llu)\n", rc ? "RESULT: FAIL" : "RESULT: PASS",

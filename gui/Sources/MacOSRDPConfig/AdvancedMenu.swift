@@ -57,7 +57,8 @@ final class AdvancedMenu: NSObject {
         Choice(key: "RDP_FPS", title: "Frame rate",
                options: [("Default", nil), ("30 fps", "30"), ("60 fps", "60")], note: nil),
         Choice(key: "RDP_AUDIO_CODEC", title: "Audio codec",
-               options: [("Auto (default)", nil), ("Auto", "auto"), ("PCM", "pcm")], note: nil),
+               options: [("PCM (default)", nil), ("PCM", "pcm"),
+                         ("IMA ADPCM, 4:1 (not yet heard on Windows)", "ima")], note: nil),
     ]
 
     private let apply: (String, String?) -> Void

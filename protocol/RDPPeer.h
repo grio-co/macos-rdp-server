@@ -159,8 +159,17 @@ struct rdp_peer_context {
     bool                 gfxReady;   /* client sent GFX caps; surfaces mapped */
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
+    bool                 channelsStarted; /* static-channel hellos sent (first activation) */
+    bool                 logonInfoSent;   /* Save Session Info logon notification sent */
+    bool                 gfxOutputReady;  /* first ResetGraphics + surfaces sent */
     bool                 audioReady; /* set by rdpsnd Activated callback */
-    /* Negotiated IMA ADPCM (RDP_AUDIO_CODEC=auto): our own encoder, blocks sent
+    uint32_t             audioSendFailures; /* rdpsnd sends rejected, for the log */
+    /* Wave Confirms from the client: one per audio PDU it has played. Bumped on
+     * the rdpsnd thread (atomic builtins); the rest is audio-thread only. */
+    uint32_t             audioConfirms;
+    uint64_t             audioFirstSendMs;  /* 0 until the first successful send */
+    bool                 audioConfirmChecked;
+    /* Negotiated IMA ADPCM (RDP_AUDIO_CODEC=ima): our own encoder, blocks sent
      * with SendSamples2. Used only from the audio thread after audioReady. */
     bool                 imaActive;
     ImaEncoder           ima;
@@ -176,6 +185,10 @@ struct rdp_peer_context {
     HANDLE               rdpdrChannel;   /* WTSVirtualChannelOpen handle */
     HANDLE               rdpdrEvent;     /* WTSVirtualEventHandle for the run loop */
     int                  rdpdrState;     /* RdpdrHandshakeState enum (int for C compat) */
+    bool                 rdpdrHeard;     /* the client has sent any rdpdr PDU */
+    bool                 rdpdrLoggedOnSent; /* Server User Logged On sent */
+    int                  rdpdrHelloTries;/* SERVER_ANNOUNCE sends so far */
+    uint64_t             rdpdrHelloMs;   /* when the last one went out */
     uint16_t             rdpdrClientId;  /* client-assigned id from ANNOUNCE_REPLY */
     uint32_t             rdpdrNextReqId; /* monotonic IRP request id counter */
     /* Pending IRP request table — up to RDPDR_MAX_PENDING in-flight requests.
@@ -297,12 +310,20 @@ RDPClipboard *rdp_peer_get_clipboard(freerdp_peer *peer);
  * tracks the local mouse smoothly instead of being tied to the (30fps) video. */
 void rdp_peer_send_default_cursor(freerdp_peer *peer);
 
+/* Largest pointer edge in pixels the client accepts: 96 with the RDP
+ * large-pointer capability, else 32. Valid after activation. */
+uint32_t rdp_peer_max_pointer_dim(freerdp_peer *peer);
+
+/* Tell the client the user is logged on (Save Session Info, logon notification),
+ * as a Windows host does after logon. Once per session; holds xportLock. */
+void rdp_peer_send_logon_info(freerdp_peer *peer);
+
 /*
  * RDPDR (drive redirection) channel support.
  *
- * rdp_peer_open_rdpdr  — open the "rdpdr" WTS static virtual channel and send
- *   SERVER_ANNOUNCE. Should be called from peer_post_connect (or later once the
- *   VCM is ready). Returns true on success.
+ * rdp_peer_open_rdpdr  — open the "rdpdr" WTS static virtual channel. Called
+ *   from peer_post_connect; SERVER_ANNOUNCE goes out at activation and is
+ *   resent while the client stays silent. Returns true on success.
  *
  * rdp_peer_pump_rdpdr  — drain inbound rdpdr data and advance the MS-RDPEFS
  *   state machine. Call from the peer run loop whenever the rdpdr channel event
@@ -323,7 +344,8 @@ void rdp_peer_pump_rdpdr(freerdp_peer *peer);
 /* IRP_MJ_CREATE — open a file or directory on the client drive.
  * desiredAccess: GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000
  * createDisposition: FILE_OPEN=1, FILE_CREATE=2, FILE_OPEN_IF=3, FILE_OVERWRITE_IF=5
- * createOptions: FILE_DIRECTORY_FILE=0x1, FILE_NON_DIRECTORY_FILE=0x40 */
+ * createOptions: FILE_DIRECTORY_FILE=0x1, FILE_NON_DIRECTORY_FILE=0x40
+ * path: UTF-8 relative to the drive root, "" for the root, else "\\a\\b". */
 bool rdpdr_send_create_req(RDPPeerContext *ctx, uint32_t deviceId,
                            const char *path,
                            uint32_t desiredAccess,
@@ -347,11 +369,20 @@ bool rdpdr_send_write_req(RDPPeerContext *ctx, uint32_t deviceId,
                           const uint8_t *data, uint32_t length,
                           RDPIrpCallback cb, void *userdata);
 
-/* IRP_MJ_DIRECTORY_CONTROL / IRP_MN_QUERY_DIRECTORY — list a directory.
- * informationClass: FileFullDirectoryInformation=2 */
+/* IRP_MJ_DIRECTORY_CONTROL / IRP_MN_QUERY_DIRECTORY — one directory entry
+ * (FileFullDirectoryInformation) per call. The first call passes the pattern,
+ * a path relative to the drive root ("\\*", "\\dir\\*" or an exact
+ * "\\dir\\name"); each next call passes NULL, until STATUS_NO_MORE_FILES. */
 bool rdpdr_send_query_dir_req(RDPPeerContext *ctx, uint32_t deviceId,
                               uint32_t fileId, const char *pattern,
                               RDPIrpCallback cb, void *userdata);
+
+/* IRP_MJ_SET_INFORMATION (FileRenameInformation) — rename or move an open
+ * file or directory to newPath (relative to the drive root, like CREATE). */
+bool rdpdr_send_rename_req(RDPPeerContext *ctx, uint32_t deviceId,
+                           uint32_t fileId, const char *newPath,
+                           bool replaceIfExists,
+                           RDPIrpCallback cb, void *userdata);
 
 /* IRP_MJ_SET_INFORMATION (FileDispositionInformation) — mark file for deletion. */
 bool rdpdr_send_delete_req(RDPPeerContext *ctx, uint32_t deviceId,

@@ -76,6 +76,11 @@ struct RDPClipboard {
     bool      capsSeen;
     bool      wantFiles, wantLock;    /* env switches */
 
+    /* Server-init handshake (caps + Monitor Ready). Run-loop thread only. */
+    uint32_t  generalFlags;           /* our CB_* general capability flags */
+    int       helloTries;             /* sends so far; 0 = not started */
+    uint64_t  helloAt;                /* now_ms() of the last send */
+
     /* Mac -> Windows (we own the clipboard) */
     bool       ownPending;
     uint32_t   ownKinds;
@@ -100,6 +105,12 @@ struct RDPClipboard {
 };
 
 static const uint8_t kDummy[8] = {0};
+
+/* Monitor Ready resend schedule while the client hasn't answered. */
+#define kHelloRetryMs 3000
+#define kHelloTries   3
+
+static void send_hello(RDPClipboard *c);
 
 /* ── small helpers ────────────────────────────────────────────────────────── */
 
@@ -321,13 +332,18 @@ static UINT cb_client_capabilities(CliprdrServerContext *cl, const CLIPRDR_CAPAB
         }
     }
     pthread_mutex_lock(&c->mu);
+    bool first = !c->capsSeen;
     c->ready = true;
     c->capsSeen = true;
     RDPFileSet *fs = rdp_fileset_retain(c->ownFiles);
     bool huge = cl->hasHugeFileSupport;
     pthread_mutex_unlock(&c->mu);
     if (fs) { rdp_fileset_set_huge(fs, huge); rdp_fileset_release(fs); }
-    /* FreeRDP has already narrowed the context's feature flags by the client's. */
+    /* FreeRDP has already narrowed the context's feature flags by the client's.
+     * One info line per session shows the handshake completed. */
+    if (first)
+        rdp_info("clipboard: client ready (version 0x%x, flags 0x%x; long names %d, files %d)",
+                 version, flags, cl->useLongFormatNames, cl->streamFileClipEnabled);
     rdp_verbose("clipboard: <- ClientCapabilities (version=0x%x flags=0x%x) negotiated: "
                 "longNames=%d files=%d noPaths=%d lock=%d huge=%d",
                 version, flags, cl->useLongFormatNames, cl->streamFileClipEnabled,
@@ -943,6 +959,14 @@ void rdp_clip_pump(RDPClipboard *c) {
         UINT rc = c->cliprdr->CheckEventHandle(c->cliprdr);
         if (rc != CHANNEL_RC_OK) { rdp_verbose("clipboard read failed: %u", rc); break; }
     }
+    /* mstsc drops a Monitor Ready that lands before its clipboard add-in is
+     * listening, and then never initializes: resend while it stays silent. */
+    pthread_mutex_lock(&c->mu);
+    bool heard = c->ready;
+    pthread_mutex_unlock(&c->mu);
+    if (!heard && c->helloTries > 0 && c->helloTries < kHelloTries &&
+        now_ms() - c->helloAt >= kHelloRetryMs)
+        send_hello(c);
     /* A copy made before the handshake finished is flushed here (not from inside
      * a callback: advertising from FreeRDP's receive dispatch re-enters it). */
     flush_advertise(c);
@@ -997,17 +1021,28 @@ RDPClipboard *rdp_clip_create(RDPPeerContext *ctx) {
     }
 
     /* The channel is pumped by the shared VCM loop, not cliprdr's own Start()
-     * thread, so the server-init handshake is never sent automatically. */
+     * thread, so the server-init handshake is never sent automatically: the
+     * peer calls rdp_clip_start once the client is activated. */
     UINT32 gf = CB_USE_LONG_FORMAT_NAMES;
     if (cl->streamFileClipEnabled) gf |= CB_STREAM_FILECLIP_ENABLED;
     if (cl->fileClipNoFilePaths)   gf |= CB_FILECLIP_NO_FILE_PATHS;
     if (cl->canLockClipData)       gf |= CB_CAN_LOCK_CLIPDATA;
     if (cl->hasHugeFileSupport)    gf |= CB_HUGE_FILE_SUPPORT_ENABLED;
+    c->generalFlags = gf;
+    rdp_verbose("clipboard channel opened (flags=0x%x); handshake waits for activation", gf);
+    return c;
+}
+
+/* Clipboard Capabilities + Monitor Ready: the server half of the MS-RDPECLIP
+ * initialization. The client answers with its own capabilities and format
+ * list. Run-loop thread. */
+static void send_hello(RDPClipboard *c) {
+    CliprdrServerContext *cl = c->cliprdr;
     CLIPRDR_GENERAL_CAPABILITY_SET general = {
         .capabilitySetType   = CB_CAPSTYPE_GENERAL,
         .capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN,
         .version             = CB_CAPS_VERSION_2,
-        .generalFlags        = gf,
+        .generalFlags        = c->generalFlags,
     };
     CLIPRDR_CAPABILITIES caps = {
         .common = { .msgType = CB_CLIP_CAPS, .msgFlags = 0, .dataLen = 4 + CB_CAPSTYPE_GENERAL_LEN },
@@ -1015,8 +1050,21 @@ RDPClipboard *rdp_clip_create(RDPPeerContext *ctx) {
         .capabilitySets = (CLIPRDR_CAPABILITY_SET *)&general,
     };
     CLIPRDR_MONITOR_READY ready = { .common = { .msgType = CB_MONITOR_READY } };
+    pthread_mutex_lock(&c->ctx->xportLock);
     UINT cc = cl->ServerCapabilities(cl, &caps);
     UINT mr = cl->MonitorReady(cl, &ready);
-    rdp_verbose("clipboard channel opened (flags=0x%x caps=%u monitor-ready=%u)", gf, cc, mr);
-    return c;
+    pthread_mutex_unlock(&c->ctx->xportLock);
+    c->helloTries++;
+    c->helloAt = now_ms();
+    if (c->helloTries == 1)
+        rdp_info("clipboard: capabilities + Monitor Ready sent (rc=%u/%u)", cc, mr);
+    else
+        rdp_info("clipboard: no reply from the client — Monitor Ready resent (%d/%d)",
+                 c->helloTries, kHelloTries);
+}
+
+void rdp_clip_start(RDPClipboard *c) {
+    if (!c || c->helloTries || !use_begin(c)) return;
+    send_hello(c);
+    use_end(c);
 }

@@ -35,6 +35,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Release binaries are buil
 | 2.7 | Non-ultrawide client (1920×1080) | Connect from 16:9 | Correct proportions | ❓ |
 | 2.7a | Dynamic resolution (MS-RDPEDISP) | Resize the client window; watch the log | `disp: client requested monitor …` appears | ⚠️ observe-only — channel receives, resize NOT applied (blocked on RESET_GRAPHICS) |
 | 2.8 | Privacy blank on connect | Set RDP_PRIVACY_BLANK=1 | Local display dims/blanks | ⚠️ (DisplayServices brightness only) |
+| 2.8a | Automatic brightness after a dimmed session | With System Settings › Displays › "Automatically adjust brightness" on, connect, then disconnect (or touch the Mac) | Log shows "automatic brightness paused" at connect and "automatic brightness back on for display N" after; the setting is on again and the screen follows the room light | ❓ needs a real session |
 | 2.9 | Shared mode | Set RDP_SHARED_MODE=1 | Remote + local see same screen | ❓ |
 | 2.10 | Wake Mac on connect | Mac display asleep, then connect | Display wakes, capture starts | ✅ (IOPMAssertion) |
 
@@ -75,13 +76,14 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Release binaries are buil
 |---|------|-------------|----------|--------|
 | 6.1 | Channel open | Connect with Drives enabled in mstsc | Log shows "rdpdr: channel open" | ✅ |
 | 6.2 | Drive enumeration | Connect with C: shared | Log shows "rdpdr: client drive C" | ✅ |
-| 6.3 | WebDAV server starts | See above | Log shows "webdav: listening on :876x" | ❓ needs test |
-| 6.4 | Volume mounts in Finder | See above | /Volumes/RDP-C appears in Finder | ❓ needs hardware test |
-| 6.5 | Browse files (PROPFIND) | Open /Volumes/RDP-C in Finder | Windows files visible | ❓ |
+| 6.3 | WebDAV server starts | See above | Log shows "webdav: accept loop started on port N" (a free port) | ❓ needs test |
+| 6.4 | Volume mounts in Finder | See above | ~/RDP-Drives/C mounts (Finder volume RDP-C) | ❓ needs hardware test |
+| 6.5 | Browse files (PROPFIND) | Open ~/RDP-Drives/C in Finder | Windows files visible | ❓ |
 | 6.6 | Read file (GET) | Open a text file | Contents correct | ❓ |
-| 6.7 | Write file (PUT) | Save a file to /Volumes/RDP-C | File appears on Windows | ❓ |
+| 6.7 | Write file (PUT) | Save a file to ~/RDP-Drives/C | File appears on Windows | ❓ |
 | 6.8 | Delete file | Trash a file | Deleted on Windows | ❓ |
-| 6.9 | Unmount on disconnect | Disconnect mstsc | /Volumes/RDP-C disappears | ❓ |
+| 6.9 | Unmount on disconnect | Disconnect mstsc | ~/RDP-Drives/C unmounts | ❓ |
+| 6.9a | Drive needs its password | During a session, `curl -X PROPFIND http://127.0.0.1:<port>/` (port from 6.3) | HTTP 401 with `WWW-Authenticate: Basic`; the Finder mount keeps working | ✅ (FreeRDP drive client) |
 | 6.10 | Printer / serial / USB | — | Not built | ❌ |
 
 **How to enable:** `RDP_RDPDR_ENABLED=1` must be in the LaunchAgent plist (set by default).  

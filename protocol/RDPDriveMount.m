@@ -20,6 +20,7 @@
 #define RDP_LOG_COMPONENT "rdpdr"
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
+#include "protocol/RDPWebDAV.h"
 
 #import <Foundation/Foundation.h>
 
@@ -32,6 +33,11 @@ void rdp_drive_mount_placeholder(const char *driveName, uint32_t deviceId) {
 
     @autoreleasepool {
         NSString *name = [NSString stringWithUTF8String:driveName];
+        /* Paths and Finder names use the safe label ("E:" -> "E"); the File
+         * Provider registration below keeps the raw DOS name. */
+        char labelC[32];
+        rdp_webdav_drive_label(driveName, labelC, sizeof(labelC));
+        NSString *label = [NSString stringWithUTF8String:labelC];
 
         /* Locate ~/Desktop/RDP-Drives/<driveName>/ */
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -44,7 +50,7 @@ void rdp_drive_mount_placeholder(const char *driveName, uint32_t deviceId) {
 
         NSURL *rdpDir  = [desktop URLByAppendingPathComponent:@"RDP-Drives"
                                                   isDirectory:YES];
-        NSURL *driveDir = [rdpDir URLByAppendingPathComponent:name
+        NSURL *driveDir = [rdpDir URLByAppendingPathComponent:label
                                                    isDirectory:YES];
 
         /* Create the directory tree if needed. */
@@ -67,13 +73,13 @@ void rdp_drive_mount_placeholder(const char *driveName, uint32_t deviceId) {
              "\n"
              "The Windows drive \"%@\" is redirected via MS-RDPEFS.\n"
              "\n"
-             "Access it at: /Volumes/RDP-%@ (mounted via WebDAV)\n"
-             "  Open Finder → Go → /Volumes/RDP-%@, or browse it in Finder's\n"
-             "  sidebar under Network. Read and write work; the WebDAV bridge\n"
+             "Access it at: ~/RDP-Drives/%@ (mounted via WebDAV; Finder names\n"
+             "  the volume RDP-%@). Open Finder → Go → Go to Folder… and type\n"
+             "  ~/RDP-Drives/%@. Read and write work; the WebDAV bridge\n"
              "  translates every file op into an IRP sent to the Windows client.\n"
              "\n"
-             "This Desktop folder is just a marker — use /Volumes/RDP-%@ instead.\n",
-            name, name, name.uppercaseString, name.uppercaseString, name.uppercaseString];
+             "This Desktop folder is just a marker — use ~/RDP-Drives/%@ instead.\n",
+            name, name, label, label, label, label];
 
         NSError *writeErr = nil;
         if (![info writeToURL:infoFile

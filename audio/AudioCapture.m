@@ -2,6 +2,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudio/CoreAudio.h>
 #include <math.h>
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 
 /* macOS 14.4+ Core Audio process-tap API. These headers ship with the
@@ -42,6 +43,7 @@ static inline int16_t clampF32(float f) {
      * would itself cause a pitch shift). */
     uint64_t _diagFrames;
     uint64_t _diagLastHostTime;
+    float    _diagPeak;          /* loudest |sample| in the current window */
     /* Pre-allocated PCM output buffer — reused across IO-proc callbacks to
      * eliminate per-callback malloc/free at ~100 Hz.  Resized (realloc)
      * only when the output frame count grows (rare: only if the ratio
@@ -112,7 +114,31 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     return NO;
 }
 
++ (NSString *)capturePermission {
+    /* TCC has no public preflight for audio capture. TCCAccessPreflight is the
+     * private call Apple's own tools use: 0 = granted, 1 = denied, anything
+     * else = not asked yet. It only reads the decision; it never prompts. */
+    typedef int (*PreflightFn)(CFStringRef service, CFDictionaryRef options);
+    static PreflightFn preflight;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY);
+        if (tcc) preflight = (PreflightFn)dlsym(tcc, "TCCAccessPreflight");
+    });
+    if (!preflight) return @"unknown";
+    int r = preflight(CFSTR("kTCCServiceAudioCapture"), NULL);
+    return r == 0 ? @"granted" : r == 1 ? @"denied" : @"not determined";
+}
+
 - (BOOL)startWithError:(NSError **)error {
+    NSString *perm = [AudioCapture capturePermission];
+    if ([perm isEqualToString:@"denied"])
+        rdp_info("audio: System Audio Recording is denied for this daemon, so the "
+                 "remote hears silence. Turn on macos-rdp-daemon under Privacy & "
+                 "Security > Screen & System Audio Recording > System Audio "
+                 "Recording Only");
+    else
+        rdp_info("audio: System Audio Recording permission: %s", perm.UTF8String);
 #if RDP_HAVE_CATAP
     if (@available(macOS 14.4, *)) {
         return [self startTapWithError:error];
@@ -222,6 +248,7 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     _resamplePhase = 0.0;
     _haveLast      = NO;
     _diagFrames       = 0;
+    _diagPeak         = 0.0f;
     _diagLastHostTime = 0;
     rdp_info("tap input format: %.0f Hz, %u ch, %u bits, flags 0x%x",
              asbd.mSampleRate, (unsigned)asbd.mChannelsPerFrame,
@@ -252,7 +279,9 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
         rdp_info("tap rate %.0f Hz != output %u Hz — linear-resampling",
                  _srcSampleRate, (unsigned)outRate);
 
-    /* 6. Register IO proc + start. */
+    /* 6. Register IO proc + start. The first start can block for as long as
+     * macOS shows its audio-capture permission prompt, so it is timed. */
+    const uint64_t startNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     err = AudioDeviceCreateIOProcID(_aggID, audio_io_proc,
                                     (__bridge void *)self, &_ioProcID);
     if (err != noErr || !_ioProcID) {
@@ -268,8 +297,14 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     }
 
     _capturing = YES;
-    rdp_info("system-audio process-tap capture started (tap=%u agg=%u)",
-             (unsigned)_tapID, (unsigned)_aggID);
+    const double startSecs =
+        (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - startNanos) / 1e9;
+    rdp_info("system-audio process-tap capture started (tap=%u agg=%u, %.1f s)",
+             (unsigned)_tapID, (unsigned)_aggID, startSecs);
+    if (startSecs > 2.0)
+        rdp_info("audio: the tap took %.0f s to start — macOS was probably asking "
+                 "for audio-capture permission (Privacy & Security > Screen & "
+                 "System Audio Recording)", startSecs);
     return YES;
 }
 #endif /* RDP_HAVE_CATAP */
@@ -329,6 +364,13 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
      * would pitch-shift. Logged ~every 5 s; cheap (no allocation). */
     if (hostTime && _hostTicksToSeconds > 0) {
         _diagFrames += inFrames;
+        /* Peak level: a tap without the audio-capture permission still runs
+         * but delivers only zeros, so "peak 0" in the log means "denied", not
+         * "nothing playing" (unless nothing is). */
+        for (size_t i = 0, n = (size_t)inFrames * srcCh; i < n; i++) {
+            float a = fabsf(in[i]);
+            if (a > _diagPeak) _diagPeak = a;
+        }
         if (_diagLastHostTime == 0) {
             _diagLastHostTime = hostTime;
         } else {
@@ -337,11 +379,13 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
             if (elapsed >= 5.0) {
                 double measured = (double)_diagFrames / elapsed;
                 rdp_info("audio delivery: %.0f frames/sec measured "
-                         "(queried src %.0f Hz, output %u Hz)",
+                         "(queried src %.0f Hz, output %u Hz), peak %.3f%s",
                          measured, _srcSampleRate,
                          (unsigned)atomic_load_explicit(&_outRate,
-                                                        memory_order_relaxed));
+                                                        memory_order_relaxed),
+                         _diagPeak, _diagPeak == 0.0f ? " (silent)" : "");
                 _diagFrames       = 0;
+                _diagPeak         = 0.0f;
                 _diagLastHostTime = hostTime;
             }
         }

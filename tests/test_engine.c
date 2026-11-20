@@ -408,12 +408,23 @@ int main(void) {
     pthread_create(&g_loop, NULL, loop_main, NULL);
     g_loopId = g_loop;
 
-    SECTION("handshake: server capabilities + monitor ready");
+    SECTION("handshake: nothing at create; capabilities + monitor ready once started");
     RDPClipboard *c = rdp_clip_create(&g_ctx);
     CHECK(c != NULL);
+    CHECK(count_out(O_CAPS) == 0 && count_out(O_MONITOR) == 0);      /* not before activation */
+    on_loop((void (*)(void *))rdp_clip_start, c);
     Out *o = wait_out(O_CAPS, 1000);
     CHECK(o && (o->generalFlags & ALL_FLAGS) == ALL_FLAGS);
     CHECK(wait_out(O_MONITOR, 1000) != NULL);
+    on_loop((void (*)(void *))rdp_clip_start, c);                    /* a second start is a no-op */
+    on_loop((void (*)(void *))rdp_clip_pump, c);                     /* too soon to resend */
+    CHECK(count_out(O_CAPS) == 0 && count_out(O_MONITOR) == 0);      /* (wait_out consumes) */
+
+    SECTION("handshake: a silent client gets Monitor Ready again");
+    usleep(3100 * 1000);
+    on_loop((void (*)(void *))rdp_clip_pump, c);
+    CHECK(wait_out(O_CAPS, 1000) != NULL && wait_out(O_MONITOR, 1000) != NULL);
+    CHECK(count_out(O_CAPS) == 0 && count_out(O_MONITOR) == 0);
     RDPClipHost host = { .user = NULL, .render = h_render, .client_clipboard = h_client };
     rdp_clip_set_host(c, &host);
 
@@ -425,6 +436,9 @@ int main(void) {
     on_loop((void (*)(void *))rdp_clip_pump, c);
     o = wait_out(O_FMTLIST, 1000);
     CHECK(o && o->n == 6);
+    usleep(3100 * 1000);                                             /* client answered: no resend */
+    on_loop((void (*)(void *))rdp_clip_pump, c);
+    CHECK(count_out(O_CAPS) == 0 && count_out(O_MONITOR) == 0);
     if (o && o->n == 6) {
         CHECK(o->ids[0] == 13 && o->names[0][0] == 0);               /* CF_UNICODETEXT, unnamed */
         CHECK(o->ids[1] >= 0xC000 && strcmp(o->names[1], "HTML Format") == 0);

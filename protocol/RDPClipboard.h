@@ -65,9 +65,12 @@ typedef struct {
 } RDPClipHost;
 
 /* ── lifecycle (RDPPeer.c) ────────────────────────────────────────────────── */
-/* Creates + opens the channel and sends Capabilities + Monitor Ready. NULL if
- * the channel could not be opened. */
+/* Creates + opens the channel (PostConnect). NULL if the channel could not be
+ * opened. */
 RDPClipboard *rdp_clip_create(RDPPeerContext *ctx);
+/* Run-loop thread, once the client is activated: send Capabilities + Monitor
+ * Ready. rdp_clip_pump resends Monitor Ready while the client stays silent. */
+void          rdp_clip_start(RDPClipboard *c);
 /* The WTS event handle to wait on (HANDLE), or NULL. */
 void         *rdp_clip_event(RDPClipboard *c);
 /* Run-loop thread, xportLock held: drain inbound PDUs, flush deferred sends. */

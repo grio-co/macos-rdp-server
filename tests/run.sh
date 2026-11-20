@@ -63,3 +63,7 @@ clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_flowcontrol.c" 
 clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_ima.c" \
     "$ROOT/audio/ImaAdpcm.c" -lm -o "$OUT/test_ima"
 "$OUT/test_ima"
+
+clang -std=gnu11 -O1 -g "${WARN[@]}" -I"$ROOT" "$ROOT/tests/test_drivepath.c" \
+    "$ROOT/protocol/RDPDrivePath.c" -o "$OUT/test_drivepath"
+"$OUT/test_drivepath"

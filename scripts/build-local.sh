@@ -111,7 +111,12 @@ cmake -S "$ROOT" -B "$OUT" -G Ninja \
     -DFREERDP_STATIC_INSTALL="$FREERDP_INSTALL" \
     -DCMAKE_PREFIX_PATH="$FREERDP_INSTALL;$OPENSSL_ROOT" \
     -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE > "$OUT.configure.log"
-cmake --build "$OUT" --parallel "$JOBS" 2>&1 | grep -E "error|warning: (unused|incompatible)|FAILED|Linking" || true
+# Show only errors and a few warnings, but fail on a failed build: without
+# this the old binary was re-signed and reported as built.
+BUILD_RC=0
+cmake --build "$OUT" --parallel "$JOBS" > "$OUT.build.log" 2>&1 || BUILD_RC=$?
+grep -E "error|warning: (unused|incompatible)|FAILED|Linking" "$OUT.build.log" || true
+[[ $BUILD_RC -eq 0 ]] || { echo "build failed (exit $BUILD_RC) — full log: $OUT.build.log" >&2; exit 1; }
 BIN="$OUT/macos-rdp-daemon"
 [[ -x "$BIN" ]] || { echo "build failed — see output above" >&2; exit 1; }
 

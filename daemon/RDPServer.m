@@ -253,12 +253,23 @@ static NSString *client_address_string(const struct sockaddr_storage *ss) {
     [_acceptSources removeAllObjects];
     for (NSNumber *fd in _listenFds) close(fd.intValue);
     [_listenFds removeAllObjects];
+    NSArray<RDPSession *> *sessions;
     @synchronized(self) {
         rdp_verbose("disconnecting %lu active sessions", (unsigned long)_sessions.count);
-        for (RDPSession *s in _sessions) [s disconnect];
+        sessions = [_sessions copy];
+        for (RDPSession *s in sessions) [s disconnect];
         [_sessions removeAllObjects];
         _activeSession = nil;
         [self updateActiveSessionFlag];
+    }
+    /* Let each session tear down before the process exits: it unmounts the
+     * client's drives (a mount left behind hangs Finder) and restores the
+     * displays. A session that hangs costs at most this long in total. */
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:2.5];
+    for (RDPSession *s in sessions) {
+        NSTimeInterval left = deadline.timeIntervalSinceNow;
+        if (left <= 0.05) break;
+        [s waitForTeardown:left];
     }
 }
 

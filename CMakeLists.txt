@@ -103,6 +103,7 @@ add_executable(macos-rdp-daemon
     protocol/RDPClipboardFiles.c
     protocol/RDPClipboardImage.c
     protocol/RDPWebDAV.c
+    protocol/RDPDrivePath.c
     protocol/RDPDriveMount.m
     display/VirtualDisplay.m
     display/DisplayArrangement.m

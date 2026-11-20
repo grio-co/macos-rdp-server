@@ -2,6 +2,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudio/CoreAudio.h>
 #include <math.h>
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 
 /* macOS 14.4+ Core Audio process-tap API. These headers ship with the
@@ -113,7 +114,31 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     return NO;
 }
 
++ (NSString *)capturePermission {
+    /* TCC has no public preflight for audio capture. TCCAccessPreflight is the
+     * private call Apple's own tools use: 0 = granted, 1 = denied, anything
+     * else = not asked yet. It only reads the decision; it never prompts. */
+    typedef int (*PreflightFn)(CFStringRef service, CFDictionaryRef options);
+    static PreflightFn preflight;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY);
+        if (tcc) preflight = (PreflightFn)dlsym(tcc, "TCCAccessPreflight");
+    });
+    if (!preflight) return @"unknown";
+    int r = preflight(CFSTR("kTCCServiceAudioCapture"), NULL);
+    return r == 0 ? @"granted" : r == 1 ? @"denied" : @"not determined";
+}
+
 - (BOOL)startWithError:(NSError **)error {
+    NSString *perm = [AudioCapture capturePermission];
+    if ([perm isEqualToString:@"denied"])
+        rdp_info("audio: System Audio Recording is denied for this daemon, so the "
+                 "remote hears silence. Turn on macos-rdp-daemon under Privacy & "
+                 "Security > Screen & System Audio Recording > System Audio "
+                 "Recording Only");
+    else
+        rdp_info("audio: System Audio Recording permission: %s", perm.UTF8String);
 #if RDP_HAVE_CATAP
     if (@available(macOS 14.4, *)) {
         return [self startTapWithError:error];

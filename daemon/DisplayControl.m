@@ -35,13 +35,24 @@
  * remote went all-black. We must never do that again — there is no fallback to
  * CGDisplayCapture anywhere in this file.
  *
- * DisplayServices is a private framework. We resolve its two symbols at runtime
+ * DisplayServices is a private framework. We resolve its symbols at runtime
  * with dlopen/dlsym (no hard link dependency); if the framework or symbols are
  * unavailable on this hardware we log clearly and fall back to NO blanking —
  * the remote keeps working and we never crash.
  *
  *   extern int DisplayServicesSetBrightness(CGDirectDisplayID, float);
  *   extern int DisplayServicesGetBrightness(CGDirectDisplayID, float *);
+ *
+ * AUTOMATIC BRIGHTNESS. While a panel is dimmed, its "Automatically adjust
+ * brightness" setting is turned off (when it was on), so the room light can't
+ * raise the dimmed panel. Undim puts the saved level back and then turns it on
+ * again, so macOS goes back to following the room light instead of holding
+ * the restored level as a manual setting. Optional: without these symbols
+ * dimming works as before.
+ *
+ *   extern bool DisplayServicesHasAmbientLightCompensation(CGDirectDisplayID);
+ *   extern int  DisplayServicesAmbientLightCompensationEnabled(CGDirectDisplayID, bool *);
+ *   extern int  DisplayServicesEnableAmbientLightCompensation(CGDirectDisplayID, bool);
  *
  * macOS single-session constraint: macOS has ONE GUI login session. This is
  * privacy DIMMING of the local panel, not a true session lock — we can't show
@@ -55,8 +66,15 @@
  */
 
 /* DisplayServices private API signatures, resolved at runtime via dlsym. */
-typedef int (*DSSetBrightnessFn)(CGDirectDisplayID, float);
-typedef int (*DSGetBrightnessFn)(CGDirectDisplayID, float *);
+typedef int  (*DSSetBrightnessFn)(CGDirectDisplayID, float);
+typedef int  (*DSGetBrightnessFn)(CGDirectDisplayID, float *);
+/* Automatic brightness: System Settings › Displays › "Automatically adjust
+ * brightness", which DisplayServices calls ambient light compensation. The
+ * argument shapes were read from the framework's code: the getter stores a bool
+ * through its pointer and returns 0, the setter takes the new value. */
+typedef bool (*DSHasAutoBrightnessFn)(CGDirectDisplayID);
+typedef int  (*DSGetAutoBrightnessFn)(CGDirectDisplayID, bool *);
+typedef int  (*DSSetAutoBrightnessFn)(CGDirectDisplayID, bool);
 
 #define DS_FRAMEWORK_PATH \
     "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
@@ -65,32 +83,75 @@ typedef int (*DSGetBrightnessFn)(CGDirectDisplayID, float *);
 static const float kDarkBrightness = 0.05f;
 static const float kRestoreFloorBrightness = 0.5f;
 
-/* While a panel is dimmed, its original brightness is also kept on disk, so a run
- * that dies mid-session can't leave the Mac's own screen dark: the next start
- * restores it (+restoreBrightnessLeftDimmed), and the next dim comes back to the
- * saved value rather than to the dark panel. */
+/* While a panel is dimmed, what the dim changed is also kept on disk, so a run
+ * that dies mid-session can't leave the Mac's own screen dark or on manual
+ * brightness: the next start restores it (+restoreBrightnessLeftDimmed), and the
+ * next dim comes back to the saved values rather than to the dark panel.
+ *
+ * Format: display id (string) -> { brightness: float, autoBrightness: bool },
+ * where autoBrightness means "it was on and the dim turned it off". A bare
+ * number (the brightness-only format of earlier builds) is still read. */
 static NSString *saved_brightness_path(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@".macos-rdp/dimmed-brightness.plist"];
 }
 
-static NSDictionary<NSString *, NSNumber *> *read_saved_brightness(void) {
+static NSDictionary *read_saved_brightness(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:saved_brightness_path()];
     return [d isKindOfClass:[NSDictionary class]] ? d : nil;
 }
 
-static void write_saved_brightness(NSDictionary<NSNumber *, NSNumber *> *saved) {
-    NSMutableDictionary<NSString *, NSNumber *> *out = [NSMutableDictionary dictionary];
-    for (NSNumber *did in saved) out[did.stringValue] = saved[did];
+/* One saved entry; NO if it's missing or unreadable. */
+static BOOL saved_entry(id value, float *brightness, BOOL *autoWasOn) {
+    *autoWasOn = NO;
+    if ([value isKindOfClass:[NSNumber class]]) {
+        *brightness = [value floatValue];
+        return YES;
+    }
+    if (![value isKindOfClass:[NSDictionary class]]) return NO;
+    id b = value[@"brightness"], a = value[@"autoBrightness"];
+    if (![b isKindOfClass:[NSNumber class]]) return NO;
+    *brightness = [b floatValue];
+    *autoWasOn = [a isKindOfClass:[NSNumber class]] && [a boolValue];
+    return YES;
+}
+
+static void write_saved_brightness(NSDictionary<NSNumber *, NSNumber *> *saved,
+                                   NSSet<NSNumber *> *autoPaused) {
+    NSMutableDictionary<NSString *, NSDictionary *> *out = [NSMutableDictionary dictionary];
+    for (NSNumber *did in saved)
+        out[did.stringValue] = @{ @"brightness": saved[did],
+                                  @"autoBrightness": @([autoPaused containsObject:did]) };
     NSString *path = saved_brightness_path();
     [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
                               withIntermediateDirectories:YES attributes:nil error:NULL];
     if (![out writeToFile:path atomically:YES])
         rdp_error("could not save the original brightness to %s — if the daemon dies "
-                  "during this session, raise the brightness by hand", path.UTF8String);
+                  "during this session, raise the brightness and turn automatic "
+                  "brightness back on by hand", path.UTF8String);
 }
 
 static void clear_saved_brightness(void) {
     [[NSFileManager defaultManager] removeItemAtPath:saved_brightness_path() error:NULL];
+}
+
+/* Turn automatic brightness back on and read it back. Run after the saved level
+ * is restored, so macOS adjusts from there to the room light instead of keeping
+ * the restored level as a manual setting. */
+static BOOL resume_auto_brightness(DSSetAutoBrightnessFn set, DSGetAutoBrightnessFn get,
+                                   CGDirectDisplayID did) {
+    int r = set ? set(did, true) : -1;
+    bool on = (r == 0);
+    if (on && get) {
+        bool now = false;
+        if (get(did, &now) == 0) on = now;
+    }
+    if (on) {
+        rdp_info("automatic brightness back on for display %u", did);
+        return YES;
+    }
+    rdp_error("turning automatic brightness back on for display %u failed (%d%s) — "
+              "the next start tries again", did, r, r == 0 ? ", it still reads off" : "");
+    return NO;
 }
 
 /* The tap's refcon. The callback reaches the DisplayControl only through this
@@ -117,11 +178,17 @@ static void clear_saved_brightness(void) {
 @property (nonatomic, assign) void *displayServicesHandle;
 @property (nonatomic, assign) DSSetBrightnessFn dsSetBrightness;
 @property (nonatomic, assign) DSGetBrightnessFn dsGetBrightness;
+/* Automatic brightness; all NULL when this macOS lacks them (dimming still works). */
+@property (nonatomic, assign) DSHasAutoBrightnessFn dsHasAutoBrightness;
+@property (nonatomic, assign) DSGetAutoBrightnessFn dsGetAutoBrightness;
+@property (nonatomic, assign) DSSetAutoBrightnessFn dsSetAutoBrightness;
 
 /* Blanking state: maps each dimmed built-in display id -> its saved brightness
- * (to restore). Empty when nothing is dimmed. */
+ * (to restore), plus the dimmed displays whose automatic brightness the dim
+ * turned off (to turn back on). Empty when nothing is dimmed. */
 @property (nonatomic, assign) BOOL displaysDimmed;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *savedBrightness;
+@property (nonatomic, strong) NSMutableSet<NSNumber *> *autoBrightnessPaused;
 
 /* Input monitor (CGEventTap on the main run loop). */
 @property (nonatomic, assign) CFMachPortRef eventTap;
@@ -157,6 +224,7 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         _displaySleepAssertion = kIOPMNullAssertionID;
         _systemSleepAssertion  = kIOPMNullAssertionID;
         _savedBrightness       = [NSMutableDictionary dictionary];
+        _autoBrightnessPaused  = [NSMutableSet set];
         const char *shared     = getenv("RDP_SHARED_MODE");
         _sharedMode            = (shared && strcmp(shared, "1") == 0);
     }
@@ -285,12 +353,31 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         _dsGetBrightness = NULL;
         return NO;
     }
+
+    /* Optional: without these, dimming still works but automatic brightness
+     * stays on through the session. */
+    _dsHasAutoBrightness = (DSHasAutoBrightnessFn)dlsym(_displayServicesHandle,
+                               "DisplayServicesHasAmbientLightCompensation");
+    _dsGetAutoBrightness = (DSGetAutoBrightnessFn)dlsym(_displayServicesHandle,
+                               "DisplayServicesAmbientLightCompensationEnabled");
+    _dsSetAutoBrightness = (DSSetAutoBrightnessFn)dlsym(_displayServicesHandle,
+                               "DisplayServicesEnableAmbientLightCompensation");
+    if (!_dsHasAutoBrightness || !_dsGetAutoBrightness || !_dsSetAutoBrightness) {
+        rdp_info("automatic brightness control unavailable — it is left as it is "
+                 "during sessions");
+        _dsHasAutoBrightness = NULL;
+        _dsGetAutoBrightness = NULL;
+        _dsSetAutoBrightness = NULL;
+    }
     return YES;
 }
 
 - (void)closeDisplayServices {
     _dsSetBrightness = NULL;
     _dsGetBrightness = NULL;
+    _dsHasAutoBrightness = NULL;
+    _dsGetAutoBrightness = NULL;
+    _dsSetAutoBrightness = NULL;
     if (_displayServicesHandle) {
         dlclose(_displayServicesHandle);
         _displayServicesHandle = NULL;
@@ -325,7 +412,7 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         return;
     }
 
-    NSDictionary<NSString *, NSNumber *> *earlier = read_saved_brightness();
+    NSDictionary *earlier = read_saved_brightness();
     for (uint32_t i = 0; i < count; i++) {
         CGDirectDisplayID did = active[i];
         if (did == _virtualDisplayID) {
@@ -348,12 +435,16 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
             continue;
         }
         /* A panel that is still dark because an earlier run died while it was
-         * dimmed comes back to the saved brightness, not to dark. */
-        NSNumber *saved = earlier[@(did).stringValue];
-        if (saved && original < kDarkBrightness) {
+         * dimmed comes back to the saved brightness, not to dark; automatic
+         * brightness that run turned off goes back on at the end of this one. */
+        float earlierBrightness = 0;
+        BOOL earlierAuto = NO;
+        BOOL haveEarlier = saved_entry(earlier[@(did).stringValue],
+                                       &earlierBrightness, &earlierAuto);
+        if (haveEarlier && original < kDarkBrightness) {
             rdp_info("display %u is still dark (%.2f) from an earlier session — "
-                     "will restore it to %.2f", did, original, saved.floatValue);
-            original = saved.floatValue;
+                     "will restore it to %.2f", did, original, earlierBrightness);
+            original = earlierBrightness;
         }
         /* With no saved value either (say, a build without the file crashed
          * mid-session), restoring "dark" would leave the desk user a black
@@ -364,16 +455,34 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
             original = kRestoreFloorBrightness;
         }
 
+        /* Automatic brightness goes off for the session, so the room light can't
+         * raise the dimmed panel and macOS doesn't take the dim (or the restore)
+         * as a manual brightness setting. Undim turns it back on. */
+        BOOL autoPaused = haveEarlier && earlierAuto && _dsSetAutoBrightness;
+        bool autoOn = false;
+        if (_dsSetAutoBrightness && _dsHasAutoBrightness(did) &&
+            _dsGetAutoBrightness(did, &autoOn) == 0 && autoOn) {
+            int ar = _dsSetAutoBrightness(did, false);
+            if (ar == 0)
+                autoPaused = YES;
+            else
+                rdp_error("couldn't pause automatic brightness on display %u (%d) — "
+                          "it stays on through the session", did, ar);
+        }
+
         int sr = _dsSetBrightness(did, 0.0f);
         if (sr != 0) {
             rdp_error("DisplayServicesSetBrightness(%u, 0) failed (%d) — "
                       "display NOT dimmed", did, sr);
+            if (autoPaused)
+                resume_auto_brightness(_dsSetAutoBrightness, _dsGetAutoBrightness, did);
             continue;
         }
 
         _savedBrightness[@(did)] = @(original);
-        rdp_info("privacy-dimmed built-in display %u (brightness %.2f -> 0)",
-                 did, original);
+        if (autoPaused) [_autoBrightnessPaused addObject:@(did)];
+        rdp_info("privacy-dimmed built-in display %u (brightness %.2f -> 0%s)",
+                 did, original, autoPaused ? ", automatic brightness paused" : "");
     }
 
     if (_savedBrightness.count == 0) {
@@ -381,11 +490,14 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
                  "is active, or none accepted brightness control) — nothing to do");
         return;
     }
-    write_saved_brightness(_savedBrightness);
+    write_saved_brightness(_savedBrightness, _autoBrightnessPaused);
     _displaysDimmed = YES;
 }
 
-/* Restore every dimmed display to its saved brightness. */
+/* Restore every dimmed display to its saved brightness, then turn automatic
+ * brightness back on where the dim paused it. In that order: macOS then adjusts
+ * from the restored level to the room light, rather than keeping it as a manual
+ * setting. */
 - (void)undimDisplays {
     if (!_displaysDimmed) return;
 
@@ -401,8 +513,12 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
             rdp_error("DisplayServicesSetBrightness(%u, %.2f) restore failed (%d)",
                       did, original, sr);
         }
+        if ([_autoBrightnessPaused containsObject:key] &&
+            !resume_auto_brightness(_dsSetAutoBrightness, _dsGetAutoBrightness, did))
+            allRestored = NO;
     }
     [_savedBrightness removeAllObjects];
+    [_autoBrightnessPaused removeAllObjects];
     _displaysDimmed = NO;
     if (allRestored) clear_saved_brightness();   /* otherwise the next start retries */
 }
@@ -488,12 +604,16 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
 #pragma mark - Recovery after an unclean exit
 
 + (void)restoreBrightnessLeftDimmed {
-    NSDictionary<NSString *, NSNumber *> *saved = read_saved_brightness();
+    NSDictionary *saved = read_saved_brightness();
     if (saved.count == 0) return;
 
     void *h = dlopen(DS_FRAMEWORK_PATH, RTLD_LAZY | RTLD_LOCAL);
     DSSetBrightnessFn set = h ? (DSSetBrightnessFn)dlsym(h, "DisplayServicesSetBrightness")
                               : NULL;
+    DSSetAutoBrightnessFn setAuto = h ? (DSSetAutoBrightnessFn)dlsym(h,
+                                        "DisplayServicesEnableAmbientLightCompensation") : NULL;
+    DSGetAutoBrightnessFn getAuto = h ? (DSGetAutoBrightnessFn)dlsym(h,
+                                        "DisplayServicesAmbientLightCompensationEnabled") : NULL;
     if (!set) {
         rdp_error("an earlier run left the built-in display dimmed, and DisplayServices "
                   "isn't available to restore it — raise the brightness by hand");
@@ -502,8 +622,11 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
     }
     BOOL allRestored = YES;
     for (NSString *key in saved) {
+        float b = 0;
+        BOOL autoWasOn = NO;
+        if (![key isKindOfClass:[NSString class]] || !saved_entry(saved[key], &b, &autoWasOn))
+            continue;
         CGDirectDisplayID did = (CGDirectDisplayID)key.longLongValue;
-        float b = saved[key].floatValue;
         int r = set(did, b);
         if (r == 0) {
             rdp_info("restored brightness %.2f on display %u (an earlier run ended "
@@ -513,6 +636,8 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
             rdp_error("restoring brightness %.2f on display %u failed (%d) — the next "
                       "session will try again", b, did, r);
         }
+        if (autoWasOn && !resume_auto_brightness(setAuto, getAuto, did))
+            allRestored = NO;
     }
     if (allRestored) clear_saved_brightness();
     dlclose(h);

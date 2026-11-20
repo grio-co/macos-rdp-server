@@ -22,11 +22,13 @@ NS_ASSUME_NONNULL_BEGIN
  *     compositing and the remote view is UNAFFECTED. The virtual display is
  *     never dimmed. Default-on; skipped entirely in shared mode, and skipped
  *     (with the remote still working) if brightness control is unavailable.
+ *     Automatic brightness is paused while the panel is dimmed and turned back
+ *     on whenever the screen is handed back (disconnect or the desk user).
  *
  *  3. Return control to the desk user — a global input monitor restores the
- *     saved brightness the moment the desk user physically touches the Mac
- *     (mouse move / key / click). It stays restored for the rest of the
- *     session (see DisplayControl.m for rationale).
+ *     saved brightness, and automatic brightness, the moment the desk user
+ *     physically touches the Mac (mouse move / key / click). It stays restored
+ *     for the rest of the session (see DisplayControl.m for rationale).
  *
  * macOS single-session constraint: macOS has ONE GUI login session, so we can't
  * show the login window locally while the remote keeps the unlocked desktop on
@@ -46,14 +48,15 @@ NS_ASSUME_NONNULL_BEGIN
  * the built-in panel to black. Safe to call once per session. Never throws. */
 - (void)start;
 
-/* Release power assertions, restore the built-in panel brightness, and tear
- * down the input monitor. Safe to call even if start failed or was never
- * called. */
+/* Release power assertions, restore the built-in panel brightness (and turn
+ * automatic brightness back on if the dim paused it), and tear down the input
+ * monitor. Safe to call even if start failed or was never called. */
 - (void)stop;
 
-/* Call once at daemon start. While a panel is dimmed, its original brightness is
- * kept in ~/.macos-rdp/dimmed-brightness.plist; if an earlier run died before
- * restoring it, this puts it back so the Mac's own screen isn't left dark. */
+/* Call once at daemon start. While a panel is dimmed, its original brightness and
+ * automatic-brightness state are kept in ~/.macos-rdp/dimmed-brightness.plist; if
+ * an earlier run died before restoring them, this puts them back so the Mac's own
+ * screen isn't left dark or on manual brightness. */
 + (void)restoreBrightnessLeftDimmed;
 
 @end

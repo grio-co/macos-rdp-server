@@ -25,6 +25,12 @@ typedef void (^AudioCaptureBlock)(const int16_t *samples, uint32_t frameCount);
 - (BOOL)startWithError:(NSError **)error;
 - (void)stop;
 
+/* This process's System Audio Recording permission (TCC service
+ * kTCCServiceAudioCapture), which the process tap needs. Screen Recording does
+ * not cover it. Without it the tap runs but delivers silence. Returns
+ * "granted", "denied", "not determined" (macOS will ask) or "unknown". */
++ (NSString *)capturePermission;
+
 @end
 
 NS_ASSUME_NONNULL_END

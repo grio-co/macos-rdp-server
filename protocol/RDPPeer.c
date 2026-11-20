@@ -2,6 +2,7 @@
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
 #include "protocol/RDPWebDAV.h"
+#include "protocol/RDPDrivePath.h"
 #include "audio/AudioInput.h"
 
 #include <freerdp/freerdp.h>
@@ -44,6 +45,13 @@
 #define RDPDR_DTYP_PARALLEL              0x00000002
 #define RDPDR_DTYP_SMARTCARD             0x00000020
 #define CAP_GENERAL_TYPE                 0x0001
+#define CAP_DRIVE_TYPE                   0x0004
+#define DRIVE_CAPABILITY_VERSION_02      0x00000002
+#define PAKID_CORE_USER_LOGGEDON         0x554C
+/* General capability extendedPDU flags (MS-RDPEFS 2.2.2.7.1) */
+#define RDPDR_DEVICE_REMOVE_PDUS         0x00000001
+#define RDPDR_CLIENT_DISPLAY_NAME_PDU    0x00000002
+#define RDPDR_USER_LOGGEDON_PDU          0x00000004
 #define RDPDR_VERSION_MAJOR              0x0001
 #define RDPDR_VERSION_MINOR              0x000C
 
@@ -81,6 +89,9 @@
 #define RDPDR_FileBasicInformation       0x00000004  /* timestamps + attrs */
 #define RDPDR_FileStandardInformation    0x00000005  /* size + allocation */
 #define RDPDR_FileDispositionInformation 0x0000000D  /* mark for deletion */
+#define RDPDR_FileRenameInformation      0x0000000A  /* rename / move */
+/* Longest drive path sent: 2047 UTF-16 units + NUL. */
+#define RDPDR_MAX_PATH_BYTES             4096
 #define RDPDR_FileFullDirectoryInformation 0x00000002 /* directory listing */
 
 /* NTSTATUS codes relevant to RDPDR — prefixed to avoid redefinition if WinPR
@@ -284,6 +295,10 @@ static void peer_apply_settings(freerdp_peer *peer) {
      * monitor its own virtual display and GFX surface (see rdp_peer_set_layout). */
     freerdp_settings_set_bool(s,   FreeRDP_UseMultimon,             TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SupportMonitorLayoutPdu, TRUE);
+    /* No UDP transport here (MS-RDPEMT). FreeRDP offers it by default, and
+     * mstsc then spends ~2 s failing to connect over UDP on every logon
+     * (client events 1102 -> 1104). */
+    freerdp_settings_set_bool(s,   FreeRDP_SupportMultitransport,   FALSE);
 
     peer_load_certificate(peer);
     rdp_debug("peer settings applied");
@@ -335,6 +350,10 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     }
     /* Fails any paste still waiting on the client, waits for in-flight users, frees the channel. */
     if (c->clip)   { rdp_clip_destroy(c->clip);              c->clip   = NULL; }
+    if (c->audioFirstSendMs)
+        rdp_info("audio: sent for %llu s, the client confirmed %u block(s)",
+                 (unsigned long long)((mono_ms() - c->audioFirstSendMs) / 1000),
+                 (unsigned)__atomic_load_n(&c->audioConfirms, __ATOMIC_RELAXED));
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     if (c->imaActive) { c->imaActive = false; ima_encoder_free(&c->ima); }
     free(c->imaBuf); c->imaBuf = NULL; c->imaCap = 0;
@@ -469,6 +488,7 @@ static void gfx_rebuild_surfaces_locked(RDPPeerContext *ctx) {
 
     if (ctx->callbacks.onKeyframeRequest)
         ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata, -1);
+    ctx->gfxOutputReady = true;
     rdp_info("GFX output ready: %ux%u desktop, %u monitor(s), AVC420%s",
              l->desktopWidth, l->desktopHeight, l->count,
              ctx->legacyGfx ? " (legacy: no ResetGraphics)" : "");
@@ -601,7 +621,11 @@ static BOOL disp_channel_id_assigned(DispServerContext *context, UINT32 channelI
 static BOOL dvc_creation_status(void *userdata, UINT32 channelId, INT32 status) {
     RDPPeerContext *ctx = (RDPPeerContext *)userdata;
     if (ctx->disp && channelId == ctx->dispChannelId && channelId != 0) {
-        if (status >= 0) ctx->dispCapsPending = true;
+        if (status >= 0) {
+            ctx->dispCapsPending = true;
+            rdp_info("client accepted the display-control channel (status 0x%08x)",
+                     (unsigned)status);
+        }
         else rdp_info("client declined the display-control channel (0x%08x) — "
                       "dynamic resolution unavailable", (unsigned)status);
     }
@@ -630,15 +654,29 @@ static uint32_t rdp_preferred_audio_rate(void) {
     return 44100;
 }
 
-/* RDP_AUDIO_CODEC: "auto" (default) prefers IMA ADPCM (4:1, about 353 kbps for
- * 44.1 kHz stereo vs 1411 kbps PCM) when the client offers it and PCM otherwise;
- * "pcm" forces PCM. */
+/* RDP_AUDIO_CODEC: "pcm" (the default; "auto" means the same) sends 16-bit PCM,
+ * about 1411 kbps for 44.1 kHz stereo. "ima" also offers IMA ADPCM (4:1, about
+ * 353 kbps) to clients that take Wave2 PDUs. IMA is opt-in until a Windows client
+ * is heard playing it: in the 2026-11-19 mstsc run the tap had sound and the IMA
+ * blocks were valid (Apple's decoder plays them back), yet mstsc stayed silent.
+ * PCM is the path mstsc has played. */
 static bool rdp_audio_adpcm_allowed(void) {
     const char *e = getenv("RDP_AUDIO_CODEC");
-    if (!e || !*e || strcmp(e, "auto") == 0) return true;
-    if (strcmp(e, "pcm") != 0)
-        rdp_info("RDP_AUDIO_CODEC=\"%s\" not recognized (auto|pcm) - using auto", e);
-    return strcmp(e, "pcm") != 0;
+    if (!e || !*e || strcmp(e, "auto") == 0 || strcmp(e, "pcm") == 0) return false;
+    if (strcmp(e, "ima") == 0) return true;
+    rdp_info("RDP_AUDIO_CODEC=\"%s\" not recognized (pcm|ima) - using pcm", e);
+    return false;
+}
+
+/* MS-RDPEA Wave Confirm: the client confirms each audio PDU once it has played
+ * it. None coming back means it drops what we send. rdpsnd thread. */
+static UINT rdpsnd_confirm_block(RdpsndServerContext *context, BYTE blockNo, UINT16 ts) {
+    RDPPeerContext *ctx = (RDPPeerContext *)context->data;
+    (void)ts;
+    if (ctx && __atomic_fetch_add(&ctx->audioConfirms, 1, __ATOMIC_RELAXED) == 0)
+        rdp_info("audio: the client confirmed its first audio block (#%u) — it is "
+                 "playing what we send", (unsigned)blockNo);
+    return CHANNEL_RC_OK;
 }
 
 /* A client format we can serve from the server list: same tag/channels/rate/bits
@@ -725,7 +763,15 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     const bool wave2 = rdpsnd->clientVersion >= RDP_RDPSND_VERSION_WAVE2;
     rdp_info("audio: client rdpsnd version %u%s", (unsigned)rdpsnd->clientVersion,
              wave2 ? "" : " (no Wave2 — PCM only)");
-    const bool adpcmOk = rdp_audio_adpcm_allowed() && wave2;
+    /* TSSNDCAPS_ALIVE (0x1) says the client will consume audio at all. dwVolume
+     * is its current volume: low word left, high word right, 0xFFFF = full. */
+    rdp_info("audio: client flags 0x%x (%s), volume L %u%% R %u%%",
+             (unsigned)rdpsnd->capsFlags,
+             (rdpsnd->capsFlags & 0x1) ? "plays audio" : "NOT alive — it will not play audio",
+             (unsigned)((rdpsnd->initialVolume & 0xFFFF) * 100 / 0xFFFF),
+             (unsigned)((rdpsnd->initialVolume >> 16) * 100 / 0xFFFF));
+    const bool imaAllowed = rdp_audio_adpcm_allowed();
+    const bool adpcmOk = imaAllowed && wave2;
     int chosen = -1;
     if (preferred) {
         if (adpcmOk) chosen = audio_find_format(rdpsnd, preferred, true);
@@ -787,7 +833,7 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
 
     ctx->audioReady = true;
     rdp_info("audio codec: %s (RDP_AUDIO_CODEC=%s)",
-             useIma ? "IMA ADPCM (4:1)" : "PCM", adpcmOk ? "auto" : "pcm");
+             useIma ? "IMA ADPCM (4:1)" : "PCM", imaAllowed ? "ima" : "pcm");
     rdp_info("audio format negotiated: client idx %d (committed %u) — "
              "%u Hz, %u ch, %u-bit, tag 0x%04x — wire wFormatNo=%u, "
              "tap will resample to %u Hz (src=play rate)",
@@ -873,8 +919,8 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     rdp_peer_open_rdpdr(peer);
 
     /* Audio. Advertise raw PCM stereo 16-bit at the standard rates mstsc
-     * expects (48000 / 44100 / 22050), plus the same rates as IMA ADPCM unless
-     * RDP_AUDIO_CODEC=pcm. Only PCM and IMA ADPCM are offered: nothing else can
+     * expects (48000 / 44100 / 22050), plus, with RDP_AUDIO_CODEC=ima, the same
+     * rates as IMA ADPCM. Only PCM and IMA ADPCM are offered: nothing else can
      * be produced here (FreeRDP's own ADPCM/MS-ADPCM encoders are compiled out
      * and broken in this build, so IMA is encoded by audio/ImaAdpcm.c).
      *
@@ -897,7 +943,7 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     if (ctx->rdpsnd) {
         static const UINT32 kRates[] = { 48000, 44100, 22050 };
         const size_t nRates = sizeof(kRates) / sizeof(kRates[0]);
-        /* PCM first, then (unless RDP_AUDIO_CODEC=pcm) the same rates as IMA
+        /* PCM first, then (with RDP_AUDIO_CODEC=ima) the same rates as IMA
          * ADPCM with the standard Windows block size. The ADPCM entries carry
          * cbSize=2 + samples-per-block as WAVEFORMATEX requires; the data
          * pointers are static (FreeRDP frees only the array). */
@@ -931,6 +977,7 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         }
         ctx->rdpsnd->data               = ctx;
         ctx->rdpsnd->Activated          = rdpsnd_activated;
+        ctx->rdpsnd->ConfirmBlock       = rdpsnd_confirm_block;
         ctx->rdpsnd->server_formats     = pcm;
         ctx->rdpsnd->num_server_formats = pcm ? nFmt : 0;
         /* Initial src_format; repointed to the selected client format on
@@ -1038,13 +1085,18 @@ static void peer_log_client(freerdp_peer *peer) {
                                                         RDP_CAPSET_TYPE_LARGE_POINTER);
     UINT32 lpf = (lp && *lp) ? freerdp_settings_get_uint32(s, FreeRDP_LargePointerFlag) : 0;
     rdp_info("client: build %u, channels [%s], pointer cache %u (color %u), "
-             "large pointers %s, max pointer %u px",
+             "large pointers %s, max pointer %u px, desktop resize %s, "
+             "scale %u%%/%u%%, early caps 0x%x",
              freerdp_settings_get_uint32(s, FreeRDP_ClientBuild), chans,
              freerdp_settings_get_uint32(s, FreeRDP_PointerCacheSize),
              freerdp_settings_get_uint32(s, FreeRDP_ColorPointerCacheSize),
              !(lp && *lp) ? "not offered"
                  : (lpf & LARGE_POINTER_FLAG_96x96) ? "96x96" : "none",
-             rdp_peer_max_pointer_dim(peer));
+             rdp_peer_max_pointer_dim(peer),
+             freerdp_settings_get_bool(s, FreeRDP_DesktopResize) ? "yes" : "no",
+             freerdp_settings_get_uint32(s, FreeRDP_DesktopScaleFactor),
+             freerdp_settings_get_uint32(s, FreeRDP_DeviceScaleFactor),
+             freerdp_settings_get_uint32(s, FreeRDP_EarlyCapabilityFlags));
 }
 
 uint32_t rdp_peer_max_pointer_dim(freerdp_peer *peer) {
@@ -1064,7 +1116,13 @@ uint32_t rdp_peer_max_pointer_dim(freerdp_peer *peer) {
 void rdp_peer_send_logon_info(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     rdpUpdate *update = peer->context->update;
-    if (!update || !update->SaveSessionInfo || ctx->logonInfoSent) return;
+    if (ctx->logonInfoSent) return;
+    /* Set even when nothing can be sent: it also lets DISP open (run loop). */
+    ctx->logonInfoSent = true;
+    if (!update || !update->SaveSessionInfo) {
+        rdp_error("logon notification unavailable (no SaveSessionInfo)");
+        return;
+    }
     const char *user = freerdp_settings_get_string(peer->context->settings, FreeRDP_Username);
     /* Local accounts log on to the machine itself, so its short name is the
      * domain, as on a Windows host. */
@@ -1076,7 +1134,6 @@ void rdp_peer_send_logon_info(freerdp_peer *peer) {
     pthread_mutex_lock(&ctx->xportLock);
     BOOL ok = update->SaveSessionInfo(peer->context, INFO_TYPE_LOGON_LONG, &info);
     pthread_mutex_unlock(&ctx->xportLock);
-    ctx->logonInfoSent = true;
     if (ok) rdp_info("logon notification sent (user=%s domain=%s)", info.username, info.domain);
     else    rdp_error("logon notification (Save Session Info) could not be sent");
 }
@@ -1307,9 +1364,14 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
-    /* Same deferral for DISP: drdynvc must be READY before a DVC can open.
-     * Failure is non-fatal — the client simply can't request resolutions. */
-    if (ok && ctx->disp && !ctx->dispOpened &&
+    /* DISP opens later than GFX: once the client has the logon notification
+     * and the first ResetGraphics (the remote monitor layout). That is the
+     * order Windows servers use, and mstsc ignored caps sent before them: the
+     * FreeRDP client resized, but mstsc never made its window resizable.
+     * drdynvc must be READY too. Failure is non-fatal — the client simply
+     * can't request resolutions. */
+    if (ok && ctx->disp && !ctx->dispOpened && ctx->gfxOutputReady &&
+        ctx->logonInfoSent &&
         WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_READY) {
         if (ctx->disp->Open(ctx->disp) == CHANNEL_RC_OK) {
             ctx->dispOpened = true;
@@ -1762,10 +1824,25 @@ bool rdp_peer_send_bitmap(freerdp_peer *peer,
     return update->SurfaceBits(update->context, &cmd);
 }
 
+/* Ten seconds after the first send, say whether the client has confirmed any
+ * of it: the one sign on this side that it is really playing. Audio thread. */
+static void audio_check_confirms(RDPPeerContext *ctx) {
+    const uint64_t now = mono_ms();
+    if (!ctx->audioFirstSendMs) { ctx->audioFirstSendMs = now; return; }
+    if (ctx->audioConfirmChecked || now - ctx->audioFirstSendMs < 10000) return;
+    ctx->audioConfirmChecked = true;
+    const uint32_t n = __atomic_load_n(&ctx->audioConfirms, __ATOMIC_RELAXED);
+    if (n == 0)
+        rdp_error("audio: 10 s of audio sent and the client confirmed none of it — "
+                  "it is not playing what we send");
+    else
+        rdp_info("audio: the client confirmed %u audio block(s) in the first 10 s", n);
+}
+
 /* A rejected send used to vanish silently, which looked exactly like "no
  * sound". Log the first one and then every 1000th. Audio thread only. */
 static void audio_note_send(RDPPeerContext *ctx, UINT rc) {
-    if (rc == CHANNEL_RC_OK) return;
+    if (rc == CHANNEL_RC_OK) { audio_check_confirms(ctx); return; }
     if (ctx->audioSendFailures++ % 1000 == 0)
         rdp_error("audio: rdpsnd send failed (rc=%u, %u so far)",
                   (unsigned)rc, (unsigned)ctx->audioSendFailures);
@@ -1839,12 +1916,15 @@ static bool rdpdr_send_server_announce(HANDLE ch) {
 }
 
 static bool rdpdr_send_caps_request(HANDLE ch) {
-    /* Header(4) + numCaps(2) + pad(2) + one GeneralCap(44) = 52 bytes */
-    wStream *s = Stream_New(NULL, 52);
+    /* Header(4) + numCaps(2) + pad(2) + GeneralCap(44) + DriveCap(8) = 60 bytes.
+     * The drive set is what Windows servers send to accept redirected drives;
+     * printers, ports and smart cards aren't served, so their sets are left out
+     * and clients don't announce those devices. */
+    wStream *s = Stream_New(NULL, 60);
     if (!s) return false;
     Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
     Stream_Write_UINT16(s, PAKID_CORE_CAPABILITY_REQUEST);
-    Stream_Write_UINT16(s, 1);    /* numCapabilities */
+    Stream_Write_UINT16(s, 2);    /* numCapabilities */
     Stream_Write_UINT16(s, 0);    /* padding */
     /* General capability set (MS-RDPEFS §2.2.2.7.1) */
     Stream_Write_UINT16(s, CAP_GENERAL_TYPE);
@@ -1856,13 +1936,33 @@ static bool rdpdr_send_caps_request(HANDLE ch) {
     Stream_Write_UINT16(s, RDPDR_VERSION_MINOR);
     Stream_Write_UINT32(s, 0x00007fff); /* ioCode1 */
     Stream_Write_UINT32(s, 0);          /* ioCode2 */
-    Stream_Write_UINT32(s, 0x0000000f); /* extendedPDU */
+    /* USER_LOGGEDON_PDU promises the Server User Logged On PDU, which clients
+     * wait for before announcing drives (rdpdr_send_user_logged_on). */
+    Stream_Write_UINT32(s, RDPDR_DEVICE_REMOVE_PDUS | RDPDR_CLIENT_DISPLAY_NAME_PDU |
+                           RDPDR_USER_LOGGEDON_PDU);  /* extendedPDU */
     Stream_Write_UINT32(s, 0);          /* extraFlags1 */
     Stream_Write_UINT32(s, 0);          /* extraFlags2 */
     Stream_Write_UINT32(s, 0);          /* specialTypeDeviceCap */
+    /* Drive capability set (MS-RDPEFS 2.2.2.7.5): header only */
+    Stream_Write_UINT16(s, CAP_DRIVE_TYPE);
+    Stream_Write_UINT16(s, 8);    /* capabilityLength */
+    Stream_Write_UINT32(s, DRIVE_CAPABILITY_VERSION_02);
     bool ok = rdpdr_write_pdu(ch, s);
     Stream_Free(s, TRUE);
-    if (ok) rdp_verbose("rdpdr: -> CAPABILITY_REQUEST (1 cap)");
+    if (ok) rdp_verbose("rdpdr: -> CAPABILITY_REQUEST (general + drive)");
+    return ok;
+}
+
+/* MS-RDPEFS 2.2.2.5: the user is logged on. Clients that saw
+ * RDPDR_USER_LOGGEDON_PDU in our capabilities announce their drives only after
+ * this, so without it mstsc never shares a drive. */
+static bool rdpdr_send_user_logged_on(HANDLE ch) {
+    wStream *s = Stream_New(NULL, 4);
+    if (!s) return false;
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, PAKID_CORE_USER_LOGGEDON);
+    bool ok = rdpdr_write_pdu(ch, s);
+    Stream_Free(s, TRUE);
     return ok;
 }
 
@@ -1938,72 +2038,17 @@ static uint32_t rdpdr_free_request(RDPPeerContext *ctx, uint32_t requestId,
     return 0;
 }
 
-/*
- * Send a DR_DRIVE_QUERY_INFORMATION_REQ to ask the client for the standard
- * file info (size + allocation) for the drive root. This is the simplest IRP
- * that gives us something useful (free space / total size) without requiring a
- * CREATE first. The server opens fileId=0 (root pseudo-handle) and asks for
- * RDPDR_FileStandardInformation. The client will respond with
- * PAKID_CORE_DEVICE_IOCOMPLETION carrying an IoStatus and the 24-byte
- * FILE_STANDARD_INFORMATION structure.
- *
- * MS-RDPEFS §2.2.3.3.9  DR_DRIVE_QUERY_INFORMATION_REQ
- * MS-RDPEFS §2.2.3.4.9  DR_DRIVE_QUERY_INFORMATION_RSP
- */
-static bool rdpdr_send_query_info_req(RDPPeerContext *ctx, uint32_t deviceId) {
-    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, "\\", NULL, NULL);
-    if (rid == 0) return false;
-
-    /* Header(4) + DeviceId(4) + FileId(4) + CompletionId(4) +
-     * MajorFunction(4) + MinorFunction(4) + Padding(20) = IRP header 44 bytes
-     * + FsInformationClass(4) + Padding(4) = 52 bytes total */
-    wStream *s = Stream_New(NULL, 52);
-    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
-
-    /* Packet header */
-    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
-    Stream_Write_UINT16(s, PAKID_CORE_DEVICE_IOREQUEST);
-
-    /* DR_IRP_REQ — MS-RDPEFS §2.2.1.4 */
-    Stream_Write_UINT32(s, deviceId);
-    Stream_Write_UINT32(s, 0);          /* FileId = 0 (root) */
-    Stream_Write_UINT32(s, rid);        /* CompletionId (our request id) */
-    Stream_Write_UINT32(s, IRP_MJ_QUERY_INFORMATION);
-    Stream_Write_UINT32(s, 0);          /* MinorFunction = 0 */
-    /* 20 bytes of padding to complete the 40-byte IRP header body */
-    Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT32(s, 0);
-
-    /* DR_DRIVE_QUERY_INFORMATION_REQ body */
-    Stream_Write_UINT32(s, RDPDR_FileStandardInformation);
-    Stream_Write_UINT32(s, 0); /* padding */
-
-    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
-    Stream_Free(s, TRUE);
-    if (ok)
-        rdp_verbose("rdpdr: -> QUERY_INFORMATION_REQ (dev=%u rid=%u "
-                    "RDPDR_FileStandardInformation)", deviceId, rid);
-    else
-        rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
-    return ok;
-}
 
 /* ── IRP send helpers ─────────────────────────────────────────────────────
  *
- * Each helper builds the standard DR_IRP_REQ header (MS-RDPEFS §2.2.1.4):
- *   Packet header  : RDPDR_CTYP_CORE(2) + PAKID_CORE_DEVICE_IOREQUEST(2)
- *   IRP body header: DeviceId(4) + FileId(4) + CompletionId(4) +
- *                    MajorFunction(4) + MinorFunction(4) + Padding(20)
- * Total fixed header = 4 + 40 = 44 bytes before the specific body.
- *
- * ALL helpers must be called under xportLock.
- * cb may be NULL for fire-and-forget requests.
+ * Each helper writes the DR_DEVICE_IOREQUEST header (MS-RDPEFS 2.2.1.4):
+ *   RDPDR_CTYP_CORE(2) + PAKID_CORE_DEVICE_IOREQUEST(2) + DeviceId(4) +
+ *   FileId(4) + CompletionId(4) + MajorFunction(4) + MinorFunction(4)
+ * = 24 bytes, then the request-specific body.
  */
 
-/* Write the common 44-byte IRP header into stream s. */
+/* Write the 24-byte DR_DEVICE_IOREQUEST header; the request body follows at
+ * once (no padding: an extra 20 bytes shifted every field the client read). */
 static void rdpdr_write_irp_header(wStream *s, uint32_t deviceId,
                                     uint32_t fileId, uint32_t rid,
                                     uint32_t majorFn, uint32_t minorFn) {
@@ -2014,40 +2059,32 @@ static void rdpdr_write_irp_header(wStream *s, uint32_t deviceId,
     Stream_Write_UINT32(s, rid);
     Stream_Write_UINT32(s, majorFn);
     Stream_Write_UINT32(s, minorFn);
-    /* 20 bytes of padding (5 x uint32 = 0x00 filler per spec). */
-    Stream_Write_UINT32(s, 0); Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT32(s, 0); Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT32(s, 0);
 }
 
 /* IRP_MJ_CREATE — open a file or directory.
- * path is UTF-8, no leading slash; internally converted to UTF-16LE. */
+ * path is UTF-8 relative to the drive root: "" for the root, else "\\a\\b"
+ * (rdpdr_path_from_url). It goes out as UTF-16LE with its NUL, which
+ * PathLength counts (MS-RDPEFS 2.2.1.4.1). */
 bool rdpdr_send_create_req(RDPPeerContext *ctx, uint32_t deviceId,
                             const char *path,
                             uint32_t desiredAccess,
                             uint32_t createDisposition,
                             uint32_t createOptions,
                             RDPIrpCallback cb, void *userdata) {
+    uint8_t wpath[RDPDR_MAX_PATH_BYTES];
+    size_t pathBytes = rdpdr_utf8_to_utf16le(path ? path : "", wpath, sizeof(wpath));
+    if (pathBytes == 0) {
+        rdp_info("rdpdr: path not sent (not UTF-8 or too long): \"%s\"", path ? path : "");
+        return false;
+    }
     uint32_t rid = rdpdr_alloc_request(ctx, deviceId, path, cb, userdata);
     if (rid == 0) return false;
 
-    /* Convert path to UTF-16LE. */
-    size_t pathLen = path ? strlen(path) : 0;
-    /* Max path: 260 chars → 520 bytes UTF-16 + 2 for NUL. */
-    uint16_t utf16[261];
-    uint32_t utf16Len = 0;
-    for (size_t i = 0; i < pathLen && i < 260; i++) {
-        /* Simple ASCII->UTF-16LE (rdpdr paths are drive-relative ASCII). */
-        utf16[utf16Len++] = (uint16_t)(unsigned char)path[i];
-    }
-    uint32_t pathBytes = utf16Len * 2; /* byte count sent on wire (no NUL) */
-
-    /* DR_CREATE_REQ body (MS-RDPEFS §2.2.3.3.1):
+    /* DR_CREATE_REQ body (MS-RDPEFS 2.2.1.4.1):
      *   DesiredAccess(4) + AllocationSize(8) + FileAttributes(4) +
      *   ShareAccess(4) + CreateDisposition(4) + CreateOptions(4) +
      *   PathLength(4) + Path(PathLength) */
-    size_t totalSize = 44 + 32 + pathBytes;
-    wStream *s = Stream_New(NULL, totalSize);
+    wStream *s = Stream_New(NULL, 24 + 32 + pathBytes);
     if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     rdpdr_write_irp_header(s, deviceId, 0, rid, IRP_MJ_CREATE, 0);
@@ -2057,14 +2094,14 @@ bool rdpdr_send_create_req(RDPPeerContext *ctx, uint32_t deviceId,
     Stream_Write_UINT32(s, 3);            /* ShareAccess = read|write */
     Stream_Write_UINT32(s, createDisposition);
     Stream_Write_UINT32(s, createOptions);
-    Stream_Write_UINT32(s, pathBytes);
-    for (uint32_t i = 0; i < utf16Len; i++) Stream_Write_UINT16(s, utf16[i]);
+    Stream_Write_UINT32(s, (uint32_t)pathBytes);
+    Stream_Write(s, wpath, pathBytes);
 
     bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
     Stream_Free(s, TRUE);
     if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
-    else rdp_verbose("rdpdr: -> CREATE_REQ dev=%u rid=%u path=\"%s\"",
-                     deviceId, rid, path ? path : "");
+    else rdp_verbose("rdpdr: -> CREATE_REQ dev=%u rid=%u path=\"%s\" access=0x%x disp=%u opts=0x%x",
+                     deviceId, rid, path ? path : "", desiredAccess, createDisposition, createOptions);
     return ok;
 }
 
@@ -2078,7 +2115,7 @@ bool rdpdr_send_close_req(RDPPeerContext *ctx, uint32_t deviceId,
     if (rid == 0) return false;
 
     /* DR_CLOSE_REQ body: just 32 bytes of padding after the IRP header. */
-    wStream *s = Stream_New(NULL, 44 + 32);
+    wStream *s = Stream_New(NULL, 24 + 32);
     if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_CLOSE, 0);
@@ -2104,7 +2141,7 @@ bool rdpdr_send_read_req(RDPPeerContext *ctx, uint32_t deviceId,
 
     /* DR_READ_REQ body (MS-RDPEFS §2.2.3.3.3):
      *   Length(4) + Offset(8) + Padding(20) */
-    wStream *s = Stream_New(NULL, 44 + 32);
+    wStream *s = Stream_New(NULL, 24 + 32);
     if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_READ, 0);
@@ -2133,7 +2170,7 @@ bool rdpdr_send_write_req(RDPPeerContext *ctx, uint32_t deviceId,
 
     /* DR_WRITE_REQ body (MS-RDPEFS §2.2.3.3.4):
      *   Length(4) + Offset(8) + Padding(20) + WriteData(Length) */
-    wStream *s = Stream_New(NULL, 44 + 32 + length);
+    wStream *s = Stream_New(NULL, 24 + 32 + length);
     if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_WRITE, 0);
@@ -2156,43 +2193,83 @@ bool rdpdr_send_write_req(RDPPeerContext *ctx, uint32_t deviceId,
 bool rdpdr_send_query_dir_req(RDPPeerContext *ctx, uint32_t deviceId,
                                uint32_t fileId, const char *pattern,
                                RDPIrpCallback cb, void *userdata) {
+    /* InitialQuery carries the pattern; a follow-up (pattern NULL) carries no
+     * path, which the client ignores anyway (MS-RDPEFS 2.2.3.3.10). */
+    uint8_t wpat[RDPDR_MAX_PATH_BYTES];
+    size_t patBytes = 0;
+    if (pattern) {
+        patBytes = rdpdr_utf8_to_utf16le(pattern, wpat, sizeof(wpat));
+        if (patBytes == 0) {
+            rdp_info("rdpdr: pattern not sent (not UTF-8 or too long): \"%s\"", pattern);
+            return false;
+        }
+    }
     char label[64];
-    snprintf(label, sizeof(label), "querydir(%u,%s)", fileId,
-             pattern ? pattern : "*");
+    snprintf(label, sizeof(label), "querydir(%u,%s)", fileId, pattern ? "first" : "next");
     uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
     if (rid == 0) return false;
 
-    /* Convert pattern to UTF-16LE */
-    const char *pat = pattern ? pattern : "*";
-    size_t patLen = strlen(pat);
-    uint16_t utf16[261];
-    uint32_t utf16Len = 0;
-    for (size_t i = 0; i < patLen && i < 260; i++)
-        utf16[utf16Len++] = (uint16_t)(unsigned char)pat[i];
-    uint32_t patBytes = utf16Len * 2;
-
-    /* DR_DRIVE_QUERY_DIRECTORY_REQ (MS-RDPEFS §2.2.3.3.10):
+    /* DR_DRIVE_QUERY_DIRECTORY_REQ (MS-RDPEFS 2.2.3.3.10):
      *   FsInformationClass(4) + InitialQuery(1) + PathLength(4) + Padding(23) + Path */
     size_t bodySize = 4 + 1 + 4 + 23 + patBytes;
-    wStream *s = Stream_New(NULL, 44 + bodySize);
+    wStream *s = Stream_New(NULL, 24 + bodySize);
     if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     rdpdr_write_irp_header(s, deviceId, fileId, rid,
                             IRP_MJ_DIRECTORY_CONTROL, IRP_MN_QUERY_DIRECTORY);
     Stream_Write_UINT32(s, RDPDR_FileFullDirectoryInformation);
-    Stream_Write_UINT8(s,  1);           /* InitialQuery = 1 (restart scan) */
-    Stream_Write_UINT32(s, patBytes);
-    /* 23 bytes padding */
-    for (int i = 0; i < 5; i++) Stream_Write_UINT32(s, 0);
-    Stream_Write_UINT8(s, 0);            /* last padding byte */
-    /* Path */
-    for (uint32_t i = 0; i < utf16Len; i++) Stream_Write_UINT16(s, utf16[i]);
+    Stream_Write_UINT8(s,  pattern ? 1 : 0);   /* InitialQuery */
+    Stream_Write_UINT32(s, (uint32_t)patBytes);
+    Stream_Zero(s, 23);                         /* Padding */
+    if (patBytes) Stream_Write(s, wpat, patBytes);
 
     bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
     Stream_Free(s, TRUE);
     if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
     else rdp_verbose("rdpdr: -> QUERY_DIR_REQ dev=%u fileId=%u pat=\"%s\" rid=%u",
-                     deviceId, fileId, pat, rid);
+                     deviceId, fileId, pattern ? pattern : "(next)", rid);
+    return ok;
+}
+
+/* IRP_MJ_SET_INFORMATION (FileRenameInformation) — rename or move an open
+ * file. newPath is relative to the drive root like a CREATE path. */
+bool rdpdr_send_rename_req(RDPPeerContext *ctx, uint32_t deviceId,
+                            uint32_t fileId, const char *newPath,
+                            bool replaceIfExists,
+                            RDPIrpCallback cb, void *userdata) {
+    uint8_t wpath[RDPDR_MAX_PATH_BYTES];
+    size_t nameBytes = rdpdr_utf8_to_utf16le(newPath ? newPath : "", wpath, sizeof(wpath));
+    if (nameBytes <= 2) {   /* not UTF-8, too long, or the root */
+        rdp_info("rdpdr: rename target not sent: \"%s\"", newPath ? newPath : "");
+        return false;
+    }
+    char label[32];
+    snprintf(label, sizeof(label), "rename(%u)", fileId);
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
+    if (rid == 0) return false;
+
+    /* DR_DRIVE_SET_INFORMATION_REQ (MS-RDPEFS 2.2.3.3.9):
+     *   FsInformationClass(4) + Length(4) + Padding(24) + SetBuffer(Length)
+     * RDP_FILE_RENAME_INFORMATION (2.2.3.3.9.1):
+     *   ReplaceIfExists(1) + RootDirectory(1) = 0 + FileNameLength(4) + FileName */
+    uint32_t setLen = (uint32_t)(6 + nameBytes);
+    wStream *s = Stream_New(NULL, 24 + 4 + 4 + 24 + setLen);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_SET_INFORMATION, 0);
+    Stream_Write_UINT32(s, RDPDR_FileRenameInformation);
+    Stream_Write_UINT32(s, setLen);
+    Stream_Zero(s, 24);
+    Stream_Write_UINT8(s, replaceIfExists ? 1 : 0);
+    Stream_Write_UINT8(s, 0);                   /* RootDirectory */
+    Stream_Write_UINT32(s, (uint32_t)nameBytes);
+    Stream_Write(s, wpath, nameBytes);
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> RENAME_REQ dev=%u fileId=%u to=\"%s\" replace=%d rid=%u",
+                     deviceId, fileId, newPath, replaceIfExists ? 1 : 0, rid);
     return ok;
 }
 
@@ -2208,7 +2285,7 @@ bool rdpdr_send_delete_req(RDPPeerContext *ctx, uint32_t deviceId,
     /* DR_SET_INFORMATION_REQ body (MS-RDPEFS §2.2.3.3.9):
      *   FsInformationClass(4) + Length(4) + Padding(24) + SetBuffer(Length)
      * FileDispositionInformation body: DeleteFile(1) = 1. */
-    wStream *s = Stream_New(NULL, 44 + 4 + 4 + 24 + 1);
+    wStream *s = Stream_New(NULL, 24 + 4 + 4 + 24 + 1);
     if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_SET_INFORMATION, 0);
@@ -2301,9 +2378,43 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
         Stream_Read_UINT16(s, numCaps);
         Stream_Read_UINT16(s, pad);
         (void)pad;
-        rdp_verbose("rdpdr: <- CAPABILITY_RESPONSE (%u caps)", (unsigned)numCaps);
-        /* We accept whatever the client advertises; no negotiation needed for
-         * enumeration-only mode. Stay in ReceivedName until device list arrives. */
+        /* Walk the sets (CAPABILITY_HEADER: type, length incl. header, version)
+         * for the client's extendedPDU flags and whether it can share drives. */
+        uint32_t extendedPdu = 0;
+        bool haveGeneral = false, drives = false;
+        for (UINT16 i = 0; i < numCaps && Stream_GetRemainingLength(s) >= 8; i++) {
+            UINT16 type, len;
+            UINT32 ver;
+            Stream_Read_UINT16(s, type);
+            Stream_Read_UINT16(s, len);
+            Stream_Read_UINT32(s, ver);
+            (void)ver;
+            size_t body = len >= 8 ? (size_t)len - 8 : 0;
+            if (body > Stream_GetRemainingLength(s)) break;
+            if (type == CAP_GENERAL_TYPE && body >= 24) {
+                /* osType(4) osVersion(4) major(2) minor(2) ioCode1(4) ioCode2(4) */
+                Stream_Seek(s, 20);
+                Stream_Read_UINT32(s, extendedPdu);
+                Stream_Seek(s, body - 24);
+                haveGeneral = true;
+            } else {
+                if (type == CAP_DRIVE_TYPE) drives = true;
+                Stream_Seek(s, body);
+            }
+        }
+        /* Without a parsable general set, assume a current client (it waits). */
+        const bool wantsLoggedOn = !haveGeneral || (extendedPdu & RDPDR_USER_LOGGEDON_PDU);
+        rdp_info("rdpdr: client capabilities: %u set(s), drives %s, waits for logon %s",
+                 (unsigned)numCaps, drives ? "yes" : "no", wantsLoggedOn ? "yes" : "no");
+        if (ctx->rdpdrState == kRdpdrReceivedName && wantsLoggedOn &&
+            !ctx->rdpdrLoggedOnSent) {
+            ctx->rdpdrLoggedOnSent = true;
+            if (rdpdr_send_user_logged_on(ctx->rdpdrChannel))
+                rdp_info("rdpdr: user logged on sent — the client may now announce drives");
+            else
+                rdp_error("rdpdr: failed to send user logged on");
+        }
+        /* Stay in ReceivedName until the device list arrives. */
         break;
     }
 
@@ -2347,8 +2458,10 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
 
                 /* Start an embedded WebDAV server and mount via mount_webdav. */
                 if (driveSlot < RDPDR_MAX_DEVICES) {
-                    /* Ports 8760..8767 — one per drive slot. */
-                    uint16_t port = (uint16_t)(8760 + (driveSlot % 100));
+                    /* Port 0: the system picks a free loopback port. Fixed
+                     * ports (8760 + slot) collided with a second session or
+                     * daemon, and the drive then never mounted. */
+                    uint16_t port = 0;
                     /* Must release xportLock before calling server_create which
                      * calls pthread_create and may need to call back into IRPs.
                      * ctx->base.peer is the owning freerdp_peer pointer. */
@@ -2360,9 +2473,11 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
 
                     if (srv) {
                         ctx->webdavServers[driveSlot] = srv;
+                        /* Async: mount_webdav's PROPFIND needs the IRP replies
+                         * this thread receives, so it must not wait here. */
                         rdp_webdav_mount(srv);
-                        rdp_info("rdpdr: WebDAV server started on port %u for drive \"%s\"",
-                                 (unsigned)port, dosName);
+                        rdp_info("rdpdr: WebDAV server started for drive \"%s\"; "
+                                 "mounting in the background", dosName);
                     } else {
                         rdp_error("rdpdr: failed to start WebDAV server for drive \"%s\"",
                                   dosName);
@@ -2373,8 +2488,6 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
                                 dosName);
                 }
 
-                /* Fire-and-forget probe to log drive capacity. */
-                rdpdr_send_query_info_req(ctx, devId);
             } else {
                 rdp_verbose("rdpdr: client device #%u — id=%u name=\"%s\" type=%s (not a drive)",
                             (unsigned)i, (unsigned)devId, dosName, typeName);
@@ -2474,6 +2587,8 @@ bool rdp_peer_open_rdpdr(freerdp_peer *peer) {
     ctx->rdpdrState    = kRdpdrIdle;
     ctx->rdpdrClientId = 0;
     ctx->rdpdrHelloTries = 0;
+    ctx->rdpdrHeard = false;
+    ctx->rdpdrLoggedOnSent = false;
     rdp_verbose("rdpdr: channel open; SERVER_ANNOUNCE waits for activation");
     return true;
 }

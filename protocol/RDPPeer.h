@@ -159,7 +159,10 @@ struct rdp_peer_context {
     bool                 gfxReady;   /* client sent GFX caps; surfaces mapped */
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
+    bool                 channelsStarted; /* static-channel hellos sent (first activation) */
+    bool                 logonInfoSent;   /* Save Session Info logon notification sent */
     bool                 audioReady; /* set by rdpsnd Activated callback */
+    uint32_t             audioSendFailures; /* rdpsnd sends rejected, for the log */
     /* Negotiated IMA ADPCM (RDP_AUDIO_CODEC=auto): our own encoder, blocks sent
      * with SendSamples2. Used only from the audio thread after audioReady. */
     bool                 imaActive;
@@ -176,6 +179,9 @@ struct rdp_peer_context {
     HANDLE               rdpdrChannel;   /* WTSVirtualChannelOpen handle */
     HANDLE               rdpdrEvent;     /* WTSVirtualEventHandle for the run loop */
     int                  rdpdrState;     /* RdpdrHandshakeState enum (int for C compat) */
+    bool                 rdpdrHeard;     /* the client has sent any rdpdr PDU */
+    int                  rdpdrHelloTries;/* SERVER_ANNOUNCE sends so far */
+    uint64_t             rdpdrHelloMs;   /* when the last one went out */
     uint16_t             rdpdrClientId;  /* client-assigned id from ANNOUNCE_REPLY */
     uint32_t             rdpdrNextReqId; /* monotonic IRP request id counter */
     /* Pending IRP request table — up to RDPDR_MAX_PENDING in-flight requests.
@@ -297,12 +303,20 @@ RDPClipboard *rdp_peer_get_clipboard(freerdp_peer *peer);
  * tracks the local mouse smoothly instead of being tied to the (30fps) video. */
 void rdp_peer_send_default_cursor(freerdp_peer *peer);
 
+/* Largest pointer edge in pixels the client accepts: 96 with the RDP
+ * large-pointer capability, else 32. Valid after activation. */
+uint32_t rdp_peer_max_pointer_dim(freerdp_peer *peer);
+
+/* Tell the client the user is logged on (Save Session Info, logon notification),
+ * as a Windows host does after logon. Once per session; holds xportLock. */
+void rdp_peer_send_logon_info(freerdp_peer *peer);
+
 /*
  * RDPDR (drive redirection) channel support.
  *
- * rdp_peer_open_rdpdr  — open the "rdpdr" WTS static virtual channel and send
- *   SERVER_ANNOUNCE. Should be called from peer_post_connect (or later once the
- *   VCM is ready). Returns true on success.
+ * rdp_peer_open_rdpdr  — open the "rdpdr" WTS static virtual channel. Called
+ *   from peer_post_connect; SERVER_ANNOUNCE goes out at activation and is
+ *   resent while the client stays silent. Returns true on success.
  *
  * rdp_peer_pump_rdpdr  — drain inbound rdpdr data and advance the MS-RDPEFS
  *   state machine. Call from the peer run loop whenever the rdpdr channel event

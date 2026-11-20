@@ -37,6 +37,39 @@ static uint32_t bitrate_for(uint32_t w, uint32_t h) {
 @implementation RDPMonitorPipeline
 @end
 
+/* Hands captured audio to the peer until the session invalidates it. Audio
+ * starts on its own queue and its IO thread runs on its own schedule, so the
+ * peer pointer lives here behind a lock: once teardown has invalidated the sink
+ * (before it frees the peer), no buffer can reach a freed peer. */
+@interface RDPAudioSink : NSObject
+- (instancetype)initWithPeer:(freerdp_peer *)peer;
+- (void)sendSamples:(const int16_t *)samples frames:(uint32_t)frames;
+- (void)invalidate;
+@end
+
+@implementation RDPAudioSink {
+    os_unfair_lock _lock;
+    freerdp_peer  *_peer;
+}
+- (instancetype)initWithPeer:(freerdp_peer *)peer {
+    if ((self = [super init])) {
+        _lock = OS_UNFAIR_LOCK_INIT;
+        _peer = peer;
+    }
+    return self;
+}
+- (void)sendSamples:(const int16_t *)samples frames:(uint32_t)frames {
+    os_unfair_lock_lock(&_lock);
+    if (_peer) rdp_peer_send_audio(_peer, samples, frames);
+    os_unfair_lock_unlock(&_lock);
+}
+- (void)invalidate {
+    os_unfair_lock_lock(&_lock);
+    _peer = NULL;
+    os_unfair_lock_unlock(&_lock);
+}
+@end
+
 @interface RDPSession () {
     /* Guards _pipelines for the keyframe callback, which runs on encoder and
      * run-loop threads; the session queue is the only writer. */
@@ -56,6 +89,8 @@ static uint32_t bitrate_for(uint32_t w, uint32_t h) {
 @property (nonatomic, strong) InputInjector   *injector;
 @property (nonatomic, strong) ClipboardSync   *clipboard;
 @property (nonatomic, strong) AudioCapture    *audio;
+@property (nonatomic, strong) RDPAudioSink    *audioSink;
+@property (nonatomic, strong) dispatch_queue_t audioQueue;   /* audio start/stop */
 @property (nonatomic, strong) CursorCapture   *cursor;
 @property (nonatomic, strong) dispatch_queue_t sessionQueue;
 /* Signaled exactly once when teardown completes; lets the takeover path wait
@@ -383,25 +418,36 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     BOOL clientWantsAudio = freerdp_settings_get_bool(
         _peer->context->settings, FreeRDP_AudioPlayback);
     if (clientWantsAudio) {
-        _audio = [[AudioCapture alloc] init];
-        _audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
+        AudioCapture *audio = [[AudioCapture alloc] init];
+        RDPAudioSink *sink = [[RDPAudioSink alloc] initWithPeer:_peer];
+        audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
             /* No per-buffer logging here: buffers arrive ~100x/sec and flooded the
              * log. AudioCapture itself logs a throttled frame total. */
-            rdp_peer_send_audio(weak.peer, samples, frameCount);
+            [sink sendSamples:samples frames:frameCount];
         };
-        NSError *audioErr = nil;
-        if (![_audio startWithError:&audioErr]) {
-            rdp_verbose("audio capture unavailable: %s",
-                        audioErr.localizedDescription.UTF8String);
-        } else {
-            rdp_verbose("audio capture started");
-        }
+        _audio = audio;
+        _audioSink = sink;
+        /* Started off this thread, which is the protocol loop: the first start
+         * can block for as long as macOS shows its audio-capture prompt (36 s
+         * in one mstsc test), and the picture, resize and sound channels all
+         * waited behind it. */
+        _audioQueue = dispatch_queue_create("com.macos-rdp.audio", DISPATCH_QUEUE_SERIAL);
+        dispatch_async(_audioQueue, ^{
+            NSError *audioErr = nil;
+            if (![audio startWithError:&audioErr])
+                rdp_info("audio capture unavailable: %s",
+                         audioErr.localizedDescription.UTF8String);
+        });
     } else {
         rdp_verbose("client did not request audio — capture skipped");
     }
 
     _sessionState = RDPSessionStateActive;
     rdp_info("session active for %s", _address.UTF8String);
+
+    /* What a Windows host sends after logon. mstsc resizes the session to its
+     * window (dynamic resolution, full screen) only after it has this. */
+    rdp_peer_send_logon_info(_peer);
 
     /* Advertise a client-side system cursor first so the very first pointer the
      * client gets is valid (and the cursor is smooth, decoupled from the video
@@ -419,6 +465,8 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     const char *curShapes = getenv("RDP_CURSOR_SHAPES");
     if (!curShapes || strcmp(curShapes, "0") != 0) {
         _cursor = [[CursorCapture alloc] init];
+        _cursor.pixelsPerPoint = [self primaryPixelsPerPoint];
+        _cursor.maxDimension = rdp_peer_max_pointer_dim(_peer);
         _cursor.handler = ^(const uint8_t *bgra, uint32_t cw, uint32_t ch,
                             uint16_t hotX, uint16_t hotY) {
             rdp_peer_send_cursor_shape(weak.peer, bgra, cw, ch, hotX, hotY);
@@ -430,6 +478,16 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
         rdp_info("cursor-shape streaming OFF (RDP_CURSOR_SHAPES=0) — client draws "
                  "the system arrow");
     }
+}
+
+/* Pixels per point of the display the remote user mainly sees (2 on HiDPI),
+ * so the pointer is drawn at the desktop's scale. */
+- (double)primaryPixelsPerPoint {
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode([self primaryDisplayID]);
+    if (!mode) return 1.0;
+    size_t px = CGDisplayModeGetPixelWidth(mode), pt = CGDisplayModeGetWidth(mode);
+    CGDisplayModeRelease(mode);
+    return (px && pt) ? (double)px / (double)pt : 1.0;
 }
 
 - (CGDirectDisplayID)primaryDisplayID {
@@ -570,6 +628,7 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
                         sourceWidth:layout.desktopWidth
                        sourceHeight:layout.desktopHeight];
     }
+    if (_cursor) _cursor.pixelsPerPoint = [self primaryPixelsPerPoint];
     return YES;
 }
 
@@ -636,7 +695,14 @@ static void rdp_on_keyframe_request(void *ud, int32_t monitorIndex) {
     NSArray<RDPMonitorPipeline *> *pipes = [self pipelineSnapshot];
     for (RDPMonitorPipeline *p in pipes) [p.capture stop];
     for (RDPMonitorPipeline *p in pipes) [p.encoder stop];
-    [_audio stop];
+    [_audioSink invalidate];   /* before rdp_peer_destroy below */
+    if (_audio) {
+        AudioCapture *audio = _audio;
+        /* On the start queue, so a start still waiting on macOS finishes first.
+         * Not waited for: a stuck start can't hold up the teardown. */
+        dispatch_async(_audioQueue, ^{ [audio stop]; });
+        _audio = nil;
+    }
     [_clipboard stop];
     [_displayControl stop];
     NSMutableArray<NSNumber *> *virtualIDs = [NSMutableArray array];

@@ -61,6 +61,10 @@ typedef int (*DSGetBrightnessFn)(CGDirectDisplayID, float *);
 #define DS_FRAMEWORK_PATH \
     "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
 
+/* Below this the panel counts as dark; a restore never goes back to dark. */
+static const float kDarkBrightness = 0.05f;
+static const float kRestoreFloorBrightness = 0.5f;
+
 /* While a panel is dimmed, its original brightness is also kept on disk, so a run
  * that dies mid-session can't leave the Mac's own screen dark: the next start
  * restores it (+restoreBrightnessLeftDimmed), and the next dim comes back to the
@@ -346,10 +350,18 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         /* A panel that is still dark because an earlier run died while it was
          * dimmed comes back to the saved brightness, not to dark. */
         NSNumber *saved = earlier[@(did).stringValue];
-        if (saved && original < 0.05f) {
+        if (saved && original < kDarkBrightness) {
             rdp_info("display %u is still dark (%.2f) from an earlier session — "
                      "will restore it to %.2f", did, original, saved.floatValue);
             original = saved.floatValue;
+        }
+        /* With no saved value either (say, a build without the file crashed
+         * mid-session), restoring "dark" would leave the desk user a black
+         * screen: come back at a usable level instead. */
+        if (original < kDarkBrightness) {
+            rdp_info("display %u is dark (%.2f) with nothing saved — will restore "
+                     "it to %.2f", did, original, kRestoreFloorBrightness);
+            original = kRestoreFloorBrightness;
         }
 
         int sr = _dsSetBrightness(did, 0.0f);

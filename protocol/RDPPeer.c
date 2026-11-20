@@ -13,6 +13,7 @@
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/channels/drdynvc.h>
+#include <freerdp/session.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <winpr/ssl.h>
@@ -23,6 +24,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ── MS-RDPEFS (rdpdr) protocol constants ──────────────────────────────── */
 /* Packet ids from MS-RDPEFS specification §2.2.1.1 */
@@ -130,6 +132,21 @@ static uint64_t mono_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
+
+/* FreeRDP keeps these private (libfreerdp/core/capabilities.h and
+ * channels/rdpsnd/common/rdpsnd_common.h). */
+#define RDP_CAPSET_TYPE_LARGE_POINTER 0x001B   /* MS-RDPBCGR 2.2.7.2.7 */
+#define RDP_RDPSND_VERSION_WAVE2      0x08     /* client takes Wave2 PDUs (Windows 8+) */
+
+/* A static channel's opening PDU (cliprdr Monitor Ready, rdpdr Server Announce)
+ * goes out once the client has finished connecting, and again if it hasn't
+ * answered after this long, up to kChannelHelloTries sends in all. mstsc's
+ * channel add-ins only start reading once the connection is up. */
+#define kChannelHelloRetryMs 3000
+#define kChannelHelloTries   3
+static void rdpdr_send_hello(RDPPeerContext *ctx);
+static void rdpdr_retry_hello(RDPPeerContext *ctx);
+static void peer_log_client(freerdp_peer *peer);
 
 static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -702,7 +719,13 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     /* Order: preferred rate (ADPCM, then PCM), then any rate (ADPCM, then PCM).
      * Rate always wins over codec: ADPCM keeps the same rate and channels as the
      * PCM it replaces, so the pitch constraint above holds for both. */
-    const bool adpcmOk = rdp_audio_adpcm_allowed();
+    /* Our IMA ADPCM blocks go out as Wave2 PDUs, which only version 8+
+     * clients take; FreeRDP refuses SendSamples2 below that, so an older
+     * client would get no sound at all. */
+    const bool wave2 = rdpsnd->clientVersion >= RDP_RDPSND_VERSION_WAVE2;
+    rdp_info("audio: client rdpsnd version %u%s", (unsigned)rdpsnd->clientVersion,
+             wave2 ? "" : " (no Wave2 — PCM only)");
+    const bool adpcmOk = rdp_audio_adpcm_allowed() && wave2;
     int chosen = -1;
     if (preferred) {
         if (adpcmOk) chosen = audio_find_format(rdpsnd, preferred, true);
@@ -980,9 +1003,82 @@ static BOOL peer_activate(freerdp_peer *peer) {
              user ? user : "(none)", domain ? domain : "(none)",
              freerdp_settings_get_string(s, FreeRDP_Password) ? "present" : "absent");
 
+    /* A reactivation (Deactivate-Reactivate) calls this again: once is enough. */
+    const bool first = !ctx->channelsStarted;
+    if (first) peer_log_client(peer);
+
     if (ctx->callbacks.onReady)
         ctx->callbacks.onReady(ctx->callbacks.userdata, w, h, d);
+
+    /* The static channels' opening PDUs go out only now that the client has
+     * finished connecting: mstsc's clipboard and drive add-ins start reading
+     * then, and drop anything sent earlier. After onReady, so the clipboard
+     * host is attached when the client's first format list arrives. */
+    if (first) {
+        ctx->channelsStarted = true;
+        if (ctx->clip) rdp_clip_start(ctx->clip);
+        rdpdr_send_hello(ctx);
+    }
     return TRUE;
+}
+
+/* One line saying what the client asked for and can do, so client-specific
+ * behaviour (mstsc vs FreeRDP) can be diagnosed from the log alone. */
+static void peer_log_client(freerdp_peer *peer) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    rdpSettings *s = peer->context->settings;
+    static const char *const kStatic[] = { "cliprdr", "rdpsnd", "rdpdr", "drdynvc" };
+    char chans[64] = "";
+    for (size_t i = 0; i < sizeof(kStatic) / sizeof(kStatic[0]); i++) {
+        if (!WTSVirtualChannelManagerIsChannelJoined(ctx->vcm, kStatic[i])) continue;
+        size_t len = strlen(chans);
+        snprintf(chans + len, sizeof(chans) - len, "%s%s", len ? "," : "", kStatic[i]);
+    }
+    const BYTE *lp = freerdp_settings_get_pointer_array(s, FreeRDP_ReceivedCapabilities,
+                                                        RDP_CAPSET_TYPE_LARGE_POINTER);
+    UINT32 lpf = (lp && *lp) ? freerdp_settings_get_uint32(s, FreeRDP_LargePointerFlag) : 0;
+    rdp_info("client: build %u, channels [%s], pointer cache %u (color %u), "
+             "large pointers %s, max pointer %u px",
+             freerdp_settings_get_uint32(s, FreeRDP_ClientBuild), chans,
+             freerdp_settings_get_uint32(s, FreeRDP_PointerCacheSize),
+             freerdp_settings_get_uint32(s, FreeRDP_ColorPointerCacheSize),
+             !(lp && *lp) ? "not offered"
+                 : (lpf & LARGE_POINTER_FLAG_96x96) ? "96x96" : "none",
+             rdp_peer_max_pointer_dim(peer));
+}
+
+uint32_t rdp_peer_max_pointer_dim(freerdp_peer *peer) {
+    rdpSettings *s = peer->context->settings;
+    const BYTE *lp = freerdp_settings_get_pointer_array(s, FreeRDP_ReceivedCapabilities,
+                                                        RDP_CAPSET_TYPE_LARGE_POINTER);
+    if (lp && *lp &&
+        (freerdp_settings_get_uint32(s, FreeRDP_LargePointerFlag) & LARGE_POINTER_FLAG_96x96))
+        return 96;
+    return 32;   /* MS-RDPBCGR 2.2.9.1.1.4.4: 32x32 without the large-pointer caps */
+}
+
+/* Save Session Info PDU, logon notification (MS-RDPBCGR 2.2.10.1). A Windows
+ * host sends it once the user is logged on, and mstsc waits for it ("login
+ * complete") before it resizes the session when its window changes, so
+ * without it dynamic resolution and full screen never kick in. */
+void rdp_peer_send_logon_info(freerdp_peer *peer) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    rdpUpdate *update = peer->context->update;
+    if (!update || !update->SaveSessionInfo || ctx->logonInfoSent) return;
+    const char *user = freerdp_settings_get_string(peer->context->settings, FreeRDP_Username);
+    /* Local accounts log on to the machine itself, so its short name is the
+     * domain, as on a Windows host. */
+    char host[256] = "";
+    if (gethostname(host, sizeof(host) - 1) != 0) host[0] = '\0';
+    char *dot = strchr(host, '.');
+    if (dot) *dot = '\0';
+    logon_info info = { .sessionId = 1, .username = (char *)(user ? user : ""), .domain = host };
+    pthread_mutex_lock(&ctx->xportLock);
+    BOOL ok = update->SaveSessionInfo(peer->context, INFO_TYPE_LOGON_LONG, &info);
+    pthread_mutex_unlock(&ctx->xportLock);
+    ctx->logonInfoSent = true;
+    if (ok) rdp_info("logon notification sent (user=%s domain=%s)", info.username, info.domain);
+    else    rdp_error("logon notification (Save Session Info) could not be sent");
 }
 
 /* Read the client's logon credentials from the negotiated peer settings. Valid
@@ -1185,6 +1281,19 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
+    /* drdynvc is started from inside the VCM check, which the event above runs
+     * only when some channel has queued data. Run it once the client is active
+     * so the GFX, display-control and audio channels never wait on unrelated
+     * traffic (FreeRDP's shadow server does the same). */
+    if (ok && peer->activated &&
+        WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_NONE &&
+        WTSVirtualChannelManagerIsChannelJoined(ctx->vcm, DRDYNVC_SVC_CHANNEL_NAME)) {
+        if (!WTSVirtualChannelManagerCheckFileDescriptor(ctx->vcm)) {
+            rdp_error("VCM check failed (drdynvc start)");
+            ok = false;
+        }
+    }
+
     /* Open the GFX dynamic virtual channel once drdynvc is READY. GFX cannot be
      * opened in PostConnect (drdynvc isn't up yet) — doing it here is how the
      * shadow server brings up DVCs. Without this the client gets no video. */
@@ -1242,6 +1351,7 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         WaitForSingleObject(ctx->rdpdrEvent, 0) == WAIT_OBJECT_0) {
         rdp_peer_pump_rdpdr(peer);
     }
+    if (ok) rdpdr_retry_hello(ctx);
 
     /* Drain AUDIO_INPUT DATA PDUs and play on Mac speaker (RDP_AUDIO_INPUT=1).
      * rdp_audio_input_pump is a read-only drain — no transport writes — so it
@@ -1513,15 +1623,23 @@ void rdp_peer_send_cursor_shape(freerdp_peer *peer,
     rdpPointerUpdate *pointer = peer->context->update->pointer;
     if (!pointer) return;
 
+    /* A pointer bigger than the client allows is a protocol error to mstsc.
+     * CursorCapture already scales to rdp_peer_max_pointer_dim. */
+    const uint32_t maxDim = rdp_peer_max_pointer_dim(peer);
+    if (w > maxDim || h > maxDim) {
+        rdp_error("cursor %ux%u exceeds the client's %u px limit — not sent", w, h, maxDim);
+        return;
+    }
+
     /* Clamp hotspot inside the bitmap. */
     if (hotX >= w) hotX = (uint16_t)(w - 1);
     if (hotY >= h) hotY = (uint16_t)(h - 1);
 
     /* ── Build the XOR (color) mask ───────────────────────────────────────
-     * mstsc renders 32bpp/alpha color pointers UNRELIABLY (it draws nothing —
-     * the cursor is invisible even though the PDUs are well-formed). We
-     * therefore emit a CLASSIC 24bpp BGR color pointer, which mstsc renders
-     * reliably (MS-RDPBCGR 2.2.9.1.1.4.4). Layout: 3 bytes/pixel (B,G,R, no
+     * A CLASSIC 24bpp BGR color pointer, which every client renders
+     * (MS-RDPBCGR 2.2.9.1.1.4.4). (Pointers once reached mstsc invisible; the
+     * cause was an all-transparent capture, see display/CursorCapture.m, not
+     * the pointer format.) Layout: 3 bytes/pixel (B,G,R, no
      * alpha), scanlines BOTTOM-UP, each row padded to a 2-byte (WORD) boundary.
      * Our input is top-down BGRA premultiplied, so we emit rows in reverse and
      * drop the alpha byte. Because alpha is premultiplied, (semi-)transparent
@@ -1568,8 +1686,26 @@ void rdp_peer_send_cursor_shape(freerdp_peer *peer,
     UINT rc = CHANNEL_RC_OK;
     bool ok = false;
 
+    /* A client that gave no pointerCacheSize can't take New Pointer updates
+     * (MS-RDPBCGR 2.2.7.1.5); the 24bpp Color Pointer update carries the same
+     * masks. */
+    const bool newPointerOk =
+        freerdp_settings_get_uint32(peer->context->settings, FreeRDP_PointerCacheSize) > 0;
+
     pthread_mutex_lock(&ctx->xportLock);
-    if (w <= RDP_CURSOR_NEW_MAX && h <= RDP_CURSOR_NEW_MAX) {
+    if (!newPointerOk && pointer->PointerColor) {
+        POINTER_COLOR_UPDATE upd = {0};
+        upd.cacheIndex    = 0;
+        upd.hotSpotX      = hotX;
+        upd.hotSpotY      = hotY;
+        upd.width         = (UINT16)w;
+        upd.height        = (UINT16)h;
+        upd.lengthAndMask = andLen;
+        upd.lengthXorMask = xorLen;
+        upd.xorMaskData   = xorData;
+        upd.andMaskData   = andData;
+        ok = pointer->PointerColor(peer->context, &upd) ? true : false;
+    } else if (w <= RDP_CURSOR_NEW_MAX && h <= RDP_CURSOR_NEW_MAX) {
         if (pointer->PointerNew) {
             POINTER_NEW_UPDATE upd = {0};
             upd.xorBpp = (UINT16)xorBpp;
@@ -1626,6 +1762,15 @@ bool rdp_peer_send_bitmap(freerdp_peer *peer,
     return update->SurfaceBits(update->context, &cmd);
 }
 
+/* A rejected send used to vanish silently, which looked exactly like "no
+ * sound". Log the first one and then every 1000th. Audio thread only. */
+static void audio_note_send(RDPPeerContext *ctx, UINT rc) {
+    if (rc == CHANNEL_RC_OK) return;
+    if (ctx->audioSendFailures++ % 1000 == 0)
+        rdp_error("audio: rdpsnd send failed (rc=%u, %u so far)",
+                  (unsigned)rc, (unsigned)ctx->audioSendFailures);
+}
+
 bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
@@ -1641,17 +1786,23 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
         }
         size_t n = ima_encode(&ctx->ima, samples, frame_count, ctx->imaBuf, ctx->imaCap);
         if (n == 0) return true;
+        /* Real timestamps, as a Windows host sends: dwAudioTimeStamp is ms since
+         * boot and wTimeStamp its low 16 bits. Zeros make the data look stale. */
+        const uint32_t ts = (uint32_t)mono_ms();
         pthread_mutex_lock(&ctx->xportLock);
         UINT rc2 = ctx->rdpsnd->SendSamples2(ctx->rdpsnd, ctx->rdpsnd->selected_client_format,
-                                             ctx->imaBuf, n, 0, 0);
+                                             ctx->imaBuf, n, (UINT16)ts, ts);
         pthread_mutex_unlock(&ctx->xportLock);
+        audio_note_send(ctx, rc2);
         return rc2 == CHANNEL_RC_OK;
     }
     /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature.
      * Audio runs on its own capture thread; serialize against the transport. */
     pthread_mutex_lock(&ctx->xportLock);
-    UINT rc = ctx->rdpsnd->SendSamples(ctx->rdpsnd, samples, frame_count, 0);
+    UINT rc = ctx->rdpsnd->SendSamples(ctx->rdpsnd, samples, frame_count,
+                                       (UINT16)mono_ms());
     pthread_mutex_unlock(&ctx->xportLock);
+    audio_note_send(ctx, rc);
     return rc == CHANNEL_RC_OK;
 }
 
@@ -2080,6 +2231,10 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
     wStream *s = Stream_StaticInit(&stack, buf, (size_t)len);
 
     if (Stream_GetRemainingLength(s) < 4) return;
+    if (!ctx->rdpdrHeard) {
+        ctx->rdpdrHeard = true;   /* stops SERVER_ANNOUNCE resends */
+        rdp_info("rdpdr: client answered — handshake under way");
+    }
     UINT16 component, packetId;
     Stream_Read_UINT16(s, component);
     Stream_Read_UINT16(s, packetId);
@@ -2316,25 +2471,37 @@ bool rdp_peer_open_rdpdr(freerdp_peer *peer) {
         WTSFreeMemory(evPtr);
     }
 
-    ctx->rdpdrState    = kRdpdrSentAnnounce;
+    ctx->rdpdrState    = kRdpdrIdle;
     ctx->rdpdrClientId = 0;
-
-    /* Send the first handshake PDU under xportLock. */
-    pthread_mutex_lock(&ctx->xportLock);
-    bool ok = rdpdr_send_server_announce(ctx->rdpdrChannel);
-    pthread_mutex_unlock(&ctx->xportLock);
-
-    if (!ok) {
-        rdp_error("rdpdr: SERVER_ANNOUNCE write failed");
-        WTSVirtualChannelClose(ctx->rdpdrChannel);
-        ctx->rdpdrChannel = NULL;
-        ctx->rdpdrEvent   = NULL;
-        ctx->rdpdrState   = kRdpdrError;
-        return false;
-    }
-
-    rdp_info("rdpdr: channel open and SERVER_ANNOUNCE sent");
+    ctx->rdpdrHelloTries = 0;
+    rdp_verbose("rdpdr: channel open; SERVER_ANNOUNCE waits for activation");
     return true;
+}
+
+/* Send (or resend) SERVER_ANNOUNCE, which starts the MS-RDPEFS handshake.
+ * Called once the client is activated and then from the run loop while the
+ * client hasn't answered. Caller holds xportLock. */
+static void rdpdr_send_hello(RDPPeerContext *ctx) {
+    if (!ctx->rdpdrChannel) return;
+    if (ctx->rdpdrState != kRdpdrIdle && ctx->rdpdrState != kRdpdrSentAnnounce) return;
+    if (ctx->rdpdrHelloTries >= kChannelHelloTries) return;
+    ctx->rdpdrHelloTries++;
+    ctx->rdpdrHelloMs = mono_ms();
+    if (!rdpdr_send_server_announce(ctx->rdpdrChannel)) {
+        rdp_error("rdpdr: SERVER_ANNOUNCE write failed");
+        ctx->rdpdrState = kRdpdrError;
+        return;
+    }
+    ctx->rdpdrState = kRdpdrSentAnnounce;
+    if (ctx->rdpdrHelloTries == 1) rdp_info("rdpdr: SERVER_ANNOUNCE sent");
+    else rdp_info("rdpdr: no reply from the client — SERVER_ANNOUNCE resent (%d/%d)",
+                  ctx->rdpdrHelloTries, kChannelHelloTries);
+}
+
+static void rdpdr_retry_hello(RDPPeerContext *ctx) {
+    if (ctx->rdpdrChannel && ctx->rdpdrState == kRdpdrSentAnnounce && !ctx->rdpdrHeard &&
+        mono_ms() - ctx->rdpdrHelloMs >= kChannelHelloRetryMs)
+        rdpdr_send_hello(ctx);
 }
 
 /* Maximum PDU size for a static virtual channel. The RDP spec limits static

@@ -11,16 +11,26 @@ typedef void (^CursorCaptureBlock)(const uint8_t *bgra,
                                    uint32_t width, uint32_t height,
                                    uint16_t hotX, uint16_t hotY);
 
-/* Polls the live on-screen system cursor on a background dispatch_source timer
- * (~12 Hz) and invokes `handler` only when the cursor shape changes (detected
- * via the CGS cursor seed + a content hash). Works headless: it does NOT use
- * NSTimer/the main run loop (this daemon has none) and reads the cursor via the
- * private CoreGraphics CGS API rather than main-thread-affine NSCursor.
+/* Polls the system cursor on a background dispatch_source timer and invokes
+ * `handler` only when the shape changes (CGS cursor seed as a hint, plus a
+ * re-read every 250 ms and a content hash). The image comes from
+ * +[NSCursor currentSystemCursor], rendered at `pixelsPerPoint` and capped at
+ * `maxDimension`. Blank images are never delivered.
  *
  * The handler is invoked on the capture's background serial queue. */
 @interface CursorCapture : NSObject
 
 @property (nonatomic, copy, nullable) CursorCaptureBlock handler;
+
+/* Pixels per point of the display the remote user sees: 1 for a 1x virtual
+ * display, 2 for HiDPI. Cursors are rendered at this scale so the remote
+ * pointer matches the desktop. Default 1. */
+@property (atomic, assign) double pixelsPerPoint;
+
+/* Longest pointer edge, in pixels, the client accepts: 32 without the RDP
+ * large-pointer capability, 96 with it. Larger cursors are scaled to fit.
+ * Default 96. */
+@property (atomic, assign) uint32_t maxDimension;
 
 /* Start polling at ~12 Hz. The first shape fires almost immediately. Safe to
  * call from any thread. */

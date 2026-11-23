@@ -342,7 +342,10 @@ void rdp_peer_pump_rdpdr(freerdp_peer *peer);
  */
 
 /* IRP_MJ_CREATE — open a file or directory on the client drive.
- * desiredAccess: GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000
+ * desiredAccess: specific rights, e.g. FILE_GENERIC_READ=0x00120089,
+ *   FILE_GENERIC_WRITE=0x00120116, FILE_LIST_DIRECTORY=0x1, DELETE=0x10000, each with
+ *   SYNCHRONIZE=0x100000. Not GENERIC_READ/GENERIC_WRITE: mstsc refused a read on a
+ *   file opened with GENERIC_READ.
  * createDisposition: FILE_OPEN=1, FILE_CREATE=2, FILE_OPEN_IF=3, FILE_OVERWRITE_IF=5
  * createOptions: FILE_DIRECTORY_FILE=0x1, FILE_NON_DIRECTORY_FILE=0x40
  * path: UTF-8 relative to the drive root, "" for the root, else "\\a\\b". */

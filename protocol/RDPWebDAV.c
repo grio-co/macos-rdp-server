@@ -67,8 +67,13 @@
 #define WD_LIST_DIRECTORY       0x00000001u   /* FILE_READ_DATA on a directory */
 #define WD_DELETE               0x00010000u
 #define WD_SYNCHRONIZE          0x00100000u
-#define WD_GENERIC_WRITE        0x40000000u
-#define WD_GENERIC_READ         0x80000000u
+/* File opens ask for specific rights, as a Windows server's redirector sends them,
+ * never GENERIC_READ / GENERIC_WRITE: mstsc opened a file asked for with GENERIC_READ
+ * and then refused the read (0xC0000022). FreeRDP's client takes either. */
+#define WD_FILE_GENERIC_READ    0x00120089u   /* READ_CONTROL | SYNCHRONIZE | READ_DATA,
+                                                 READ_EA, READ_ATTRIBUTES */
+#define WD_FILE_GENERIC_WRITE   0x00120116u   /* READ_CONTROL | SYNCHRONIZE | WRITE_DATA,
+                                                 APPEND_DATA, WRITE_EA, WRITE_ATTRIBUTES */
 #define WD_FILE_OPEN            1u
 #define WD_FILE_CREATE          2u
 #define WD_FILE_OVERWRITE_IF    5u
@@ -977,11 +982,14 @@ static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, boo
     if (headOnly) { http_head(fd, 200, "OK", hdrs, (long long)e.size); return; }
 
     uint32_t fid = 0;
-    st = open_file(ctx, devId, rdpPath, WD_GENERIC_READ | WD_SYNCHRONIZE, WD_FILE_OPEN,
+    st = open_file(ctx, devId, rdpPath, WD_FILE_GENERIC_READ, WD_FILE_OPEN,
                    WD_OPT_NON_DIRECTORY | WD_OPT_SYNC_IO, &fid, NULL);
     if (st) { respond_failure(fd, req->method, req->path, st); return; }
 
-    bool ok = http_head(fd, 200, "OK", hdrs, -1);
+    /* "200 OK" goes out only once the first read has succeeded, so a refused read
+     * (access denied, a lock conflict) is a clean HTTP error. A body cut off after
+     * the status line makes webdavfs drop the whole mount. */
+    bool ok = true, started = false;
     uint64_t off = 0;
     while (ok) {
         IrpWaiter *w = irp_waiter_alloc();
@@ -995,7 +1003,12 @@ static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, boo
             n = rd32(r->payload);                 /* DR_READ_RSP: Length(4), ReadData */
             if (n > r->payloadLen - 4) n = r->payloadLen - 4;
         }
-        if (n > 0) {
+        if (st == NT_END_OF_FILE) st = 0;         /* carries no data */
+        if (st == 0 && !started) {
+            started = true;
+            ok = http_head(fd, 200, "OK", hdrs, -1);
+        }
+        if (ok && n > 0) {
             char ch[16];
             int hl = snprintf(ch, sizeof(ch), "%x\r\n", (unsigned)n);
             ok = http_send(fd, ch, (size_t)hl) &&
@@ -1004,11 +1017,11 @@ static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, boo
             off += n;
         }
         irp_waiter_unref(r);
-        if (st == NT_END_OF_FILE) { st = 0; break; }
         if (st != 0) { ok = false; break; }
         if (n < WEBDAV_IO_CHUNK) break;           /* short read: end of file */
     }
     close_file(ctx, devId, fid);
+    if (!started) { respond_failure(fd, req->method, req->path, st); return; }
     if (ok && http_send(fd, "0\r\n\r\n", 5)) {
         if (!srv->loggedRead) {
             srv->loggedRead = true;
@@ -1036,7 +1049,7 @@ static void handle_put(RDPWebDAVServer *srv, int fd, const HttpRequest *req, Bod
     uint32_t fid = 0;
     uint8_t info = 0;
     uint32_t st = open_file(ctx, devId, rdpPath,
-                            WD_GENERIC_READ | WD_GENERIC_WRITE | WD_SYNCHRONIZE,
+                            WD_FILE_GENERIC_READ | WD_FILE_GENERIC_WRITE,
                             WD_FILE_OVERWRITE_IF, WD_OPT_NON_DIRECTORY | WD_OPT_SYNC_IO,
                             &fid, &info);
     if (st) { respond_failure(fd, req->method, req->path, st); return; }
@@ -1178,7 +1191,7 @@ static void handle_lock(RDPWebDAVServer *srv, int fd, const HttpRequest *req, bo
             uint32_t st = stat_path(ctx, devId, rdpPath, &e);
             if (st && http_code_for(st) == 404) {
                 uint32_t fid = 0;
-                st = open_file(ctx, devId, rdpPath, WD_GENERIC_WRITE | WD_SYNCHRONIZE,
+                st = open_file(ctx, devId, rdpPath, WD_FILE_GENERIC_WRITE,
                                WD_FILE_CREATE, WD_OPT_NON_DIRECTORY | WD_OPT_SYNC_IO, &fid, NULL);
                 if (st == 0) { close_file(ctx, devId, fid); code = 201; }
             }

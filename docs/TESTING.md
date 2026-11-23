@@ -79,7 +79,7 @@ Test client: Windows `mstsc` → macOS Tahoe 26 arm64. Release binaries are buil
 | 6.3 | WebDAV server starts | See above | Log shows "webdav: accept loop started on port N" (a free port) | ❓ needs test |
 | 6.4 | Volume mounts in Finder | See above | ~/RDP-Drives/C mounts (Finder volume RDP-C) | ❓ needs hardware test |
 | 6.5 | Browse files (PROPFIND) | Open ~/RDP-Drives/C in Finder | Windows files visible | ❓ |
-| 6.6 | Read file (GET) | Open a text file | Contents correct | ❓ |
+| 6.6 | Read file (GET) | Open a text file | Contents correct. A read Windows refuses gives an error, and the drive stays mounted | ❓ |
 | 6.7 | Write file (PUT) | Save a file to ~/RDP-Drives/C | File appears on Windows | ❓ |
 | 6.8 | Delete file | Trash a file | Deleted on Windows | ❓ |
 | 6.9 | Unmount on disconnect | Disconnect mstsc | ~/RDP-Drives/C unmounts | ❓ |

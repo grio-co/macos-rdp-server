@@ -99,9 +99,7 @@
 #define RDPDR_STATUS_SUCCESS             0x00000000
 #define RDPDR_STATUS_NO_MORE_FILES       0x80000006  /* end of directory listing */
 
-/* IRP_MJ_CREATE access and disposition constants */
-#define RDPDR_GENERIC_READ               0x80000000
-#define RDPDR_GENERIC_WRITE              0x40000000
+/* IRP_MJ_CREATE disposition constants (access masks: see RDPPeer.h) */
 #define RDPDR_FILE_OPEN                  0x00000001
 #define RDPDR_FILE_CREATE                0x00000002
 #define RDPDR_FILE_OPEN_IF               0x00000003

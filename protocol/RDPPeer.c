@@ -2617,29 +2617,47 @@ static void rdpdr_retry_hello(RDPPeerContext *ctx) {
         rdpdr_send_hello(ctx);
 }
 
-/* Maximum PDU size for a static virtual channel. The RDP spec limits static
- * VC PDUs to CHANNEL_CHUNK_LENGTH (1600) per write, and rdpdr PDUs are
- * small (handshake packets < 100 bytes; device list < 512 bytes). 4096
- * gives comfortable headroom for a list of many devices. */
-#define RDPDR_READ_BUF_SIZE 4096
+/* Largest rdpdr message taken from a client. A READ reply carries up to 64 KiB of file
+ * data (WEBDAV_IO_CHUNK), and a printer's device announcement can be long too; anything
+ * near this comes from a broken or hostile client. */
+#define RDPDR_MAX_MESSAGE (4u * 1024u * 1024u)
 
 /*
- * Drain all pending inbound PDUs from the rdpdr channel and advance the
+ * Drain all pending inbound messages from the rdpdr channel and advance the
  * MS-RDPEFS handshake state machine. Called from the peer run loop under
  * xportLock whenever the rdpdr event handle fires.
+ *
+ * Each message is read whole. WTSVirtualChannelRead hands a message that is longer than
+ * the caller's buffer out in pieces, and every piece was then parsed as a message of its
+ * own: a file read over 4 KB came back cut short, with the rest logged as unknown
+ * components. A NULL buffer asks for the length of the next message and takes nothing.
  */
 void rdp_peer_pump_rdpdr(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->rdpdrChannel || ctx->rdpdrState == kRdpdrError) return;
 
-    /* WTSVirtualChannelRead(handle, timeout_ms, buf, bufSize, &bytesRead).
-     * timeout=0 → non-blocking; returns FALSE when no data is pending. */
-    BYTE  buf[RDPDR_READ_BUF_SIZE];
-    ULONG bytesRead = 0;
-    while (WTSVirtualChannelRead(ctx->rdpdrChannel, 0,
-                                  (PCHAR)buf, (ULONG)sizeof(buf), &bytesRead)
-           && bytesRead > 0) {
-        rdpdr_handle_pdu(ctx, buf, bytesRead);
-        bytesRead = 0;
+    while (ctx->rdpdrChannel && ctx->rdpdrState != kRdpdrError) {
+        /* timeout=0 → non-blocking; returns FALSE when no data is pending. */
+        ULONG len = 0;
+        if (!WTSVirtualChannelRead(ctx->rdpdrChannel, 0, NULL, 0, &len)) break;
+        if (len > RDPDR_MAX_MESSAGE) {
+            rdp_error("rdpdr: a client message of %lu bytes is over the %u-byte limit — "
+                      "drive redirection is off for this session",
+                      (unsigned long)len, RDPDR_MAX_MESSAGE);
+            ctx->rdpdrState = kRdpdrError;
+            break;
+        }
+
+        ULONG cap = len > 0 ? len : 1;   /* a read with a 1-byte buffer drops an empty message */
+        BYTE *buf = (BYTE *)malloc(cap);
+        if (!buf) {
+            rdp_error("rdpdr: out of memory for a %lu-byte message", (unsigned long)len);
+            ctx->rdpdrState = kRdpdrError;
+            break;
+        }
+        ULONG bytesRead = 0;
+        BOOL  ok = WTSVirtualChannelRead(ctx->rdpdrChannel, 0, (PCHAR)buf, cap, &bytesRead);
+        if (ok && bytesRead > 0) rdpdr_handle_pdu(ctx, buf, bytesRead);
+        free(buf);
+        if (!ok) break;
     }
 }

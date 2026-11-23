@@ -285,3 +285,45 @@ bool rdp_http_basic_auth_ok(const char *value, size_t len, const char *expectUse
     memset_s(got, sizeof(got), 0, sizeof(got));
     return diff == 0;
 }
+
+/* Digits of a range bound; saturates. *present is false for an empty bound. */
+static bool range_number(const char *s, size_t n, uint64_t *out, bool *present) {
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v > (UINT64_MAX - 9) / 10 ? UINT64_MAX : v * 10 + (uint64_t)(s[i] - '0');
+    }
+    *present = n > 0;
+    *out = v;
+    return true;
+}
+
+int rdp_http_byte_range(const char *value, size_t len, uint64_t size,
+                        uint64_t *first, uint64_t *last) {
+    while (len && (*value == ' ' || *value == '\t')) { value++; len--; }
+    while (len && (value[len - 1] == ' ' || value[len - 1] == '\t')) len--;
+    if (len < 6 || strncasecmp(value, "bytes=", 6) != 0) return 0;
+    value += 6;
+    len -= 6;
+    while (len && (*value == ' ' || *value == '\t')) { value++; len--; }
+    if (len == 0 || memchr(value, ',', len)) return 0;      /* empty, or several ranges */
+    const char *dash = (const char *)memchr(value, '-', len);
+    if (!dash) return 0;
+
+    uint64_t a = 0, b = 0;
+    bool hasA = false, hasB = false;
+    if (!range_number(value, (size_t)(dash - value), &a, &hasA) ||
+        !range_number(dash + 1, len - (size_t)(dash + 1 - value), &b, &hasB) ||
+        (!hasA && !hasB) || (hasA && hasB && b < a))
+        return 0;
+    if (!hasA) {                                            /* "-count": the last bytes */
+        if (b == 0 || size == 0) return -1;
+        *first = b < size ? size - b : 0;
+        *last = size - 1;
+        return 1;
+    }
+    if (a >= size) return -1;
+    *first = a;
+    *last = hasB && b < size ? b : size - 1;
+    return 1;
+}

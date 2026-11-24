@@ -57,3 +57,11 @@ long rdp_base64_decode(const char *in, size_t inLen, uint8_t *out, size_t outCap
  * comparison takes the same time wherever the credentials differ. An empty
  * expectUserPass never matches. */
 bool rdp_http_basic_auth_ok(const char *value, size_t len, const char *expectUserPass);
+
+/* Reads one byte range from a Range header value (len bytes: "bytes=first-last",
+ * "bytes=first-" or "bytes=-count") for a file of size bytes.
+ *    1  *first to *last (inclusive) is the part to send; *last < size
+ *    0  not usable (another unit, several ranges, bad syntax): send the whole file
+ *   -1  no byte of the file is in the range: answer 416 */
+int rdp_http_byte_range(const char *value, size_t len, uint64_t size,
+                        uint64_t *first, uint64_t *last);

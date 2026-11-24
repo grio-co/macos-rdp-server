@@ -620,12 +620,14 @@ typedef struct {
     long long contentLength;                 /* -1 = none */
     bool      chunked, expectContinue, overwrite, hasDestination;
     bool      authPresent, authorized;       /* Authorization: sent / right */
+    char      range[64], ifRange[96];        /* Range:, If-Range: (empty = not sent) */
 } HttpRequest;
 
 static const char *reason_for(int code) {
     switch (code) {
     case 200: return "OK";                case 201: return "Created";
     case 204: return "No Content";        case 207: return "Multi-Status";
+    case 206: return "Partial Content";   case 416: return "Range Not Satisfiable";
     case 400: return "Bad Request";       case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";         case 405: return "Method Not Allowed";
@@ -760,6 +762,10 @@ static int parse_request(const char *buf, size_t len, const char *expectUserPass
             st = target_to_path(v, vl, req->destination, sizeof(req->destination));
             if (st) return st;
             req->hasDestination = true;
+        } else if (hdr_is(p, l, "Range", &v, &vl)) {
+            if (vl < sizeof(req->range)) { memcpy(req->range, v, vl); req->range[vl] = '\0'; }
+        } else if (hdr_is(p, l, "If-Range", &v, &vl)) {
+            if (vl < sizeof(req->ifRange)) { memcpy(req->ifRange, v, vl); req->ifRange[vl] = '\0'; }
         } else if (hdr_is(p, l, "Authorization", &v, &vl)) {
             req->authPresent = true;
             req->authorized = rdp_http_basic_auth_ok(v, vl, expectUserPass);
@@ -961,7 +967,17 @@ static void handle_propfind(RDPWebDAVServer *srv, int fd, const HttpRequest *req
     free(x.buf);
 }
 
-/* GET / HEAD — a file's bytes, streamed chunked as the client reads them. */
+/* Answers 416 for a range that starts at or after the end of the file. */
+static void respond_range_not_satisfiable(int fd, uint64_t size) {
+    char cr[64];
+    snprintf(cr, sizeof(cr), "Content-Range: bytes */%llu\r\n", (unsigned long long)size);
+    http_respond(fd, 416, reason_for(416), cr, NULL, 0);
+}
+
+/* GET / HEAD — a file's bytes. The whole file is streamed chunked as the client reads it.
+ * A single Range gets 206 with exactly those bytes: macOS's webdavfs asks for part of a big
+ * file when a page of it is needed, and puts whatever comes back at that offset, so the
+ * whole file sent instead landed in the wrong place. */
 static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, bool headOnly) {
     RDPPeerContext *ctx = srv_ctx(srv);
     const uint32_t devId = srv->deviceId;
@@ -972,13 +988,29 @@ static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, boo
     if (st) { respond_failure(fd, req->method, req->path, st); return; }
     if (e.attrs & FILE_ATTR_DIRECTORY) { respond_code(fd, 405); return; }
 
-    char date[40], hdrs[256];
+    char date[40], etag[40], hdrs[512];
     rdp_http_date_from_filetime(e.lastWrite, date, sizeof(date));
-    snprintf(hdrs, sizeof(hdrs),
-             "Content-Type: application/octet-stream\r\nLast-Modified: %s\r\n"
-             "ETag: \"%llx-%llx\"\r\n%s",
-             date, (unsigned long long)e.lastWrite, (unsigned long long)e.size,
-             headOnly ? "" : "Transfer-Encoding: chunked\r\n");
+    snprintf(etag, sizeof(etag), "\"%llx-%llx\"", (unsigned long long)e.lastWrite,
+             (unsigned long long)e.size);
+
+    uint64_t first = 0, last = 0;
+    bool ranged = false;
+    if (!headOnly && req->range[0] &&
+        /* If-Range: a part only of the same file the client already saw, else all of it. */
+        (!req->ifRange[0] || strcmp(req->ifRange, etag) == 0 || strcmp(req->ifRange, date) == 0)) {
+        int rr = rdp_http_byte_range(req->range, strlen(req->range), e.size, &first, &last);
+        if (rr < 0) { respond_range_not_satisfiable(fd, e.size); return; }
+        ranged = rr > 0;
+    }
+
+    int hn = snprintf(hdrs, sizeof(hdrs),
+                      "Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n"
+                      "Last-Modified: %s\r\nETag: %s\r\n", date, etag);
+    if (ranged)
+        snprintf(hdrs + hn, sizeof(hdrs) - (size_t)hn, "Content-Range: bytes %llu-%llu/%llu\r\n",
+                 (unsigned long long)first, (unsigned long long)last, (unsigned long long)e.size);
+    else if (!headOnly)
+        snprintf(hdrs + hn, sizeof(hdrs) - (size_t)hn, "Transfer-Encoding: chunked\r\n");
     if (headOnly) { http_head(fd, 200, "OK", hdrs, (long long)e.size); return; }
 
     uint32_t fid = 0;
@@ -986,15 +1018,17 @@ static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, boo
                    WD_OPT_NON_DIRECTORY | WD_OPT_SYNC_IO, &fid, NULL);
     if (st) { respond_failure(fd, req->method, req->path, st); return; }
 
-    /* "200 OK" goes out only once the first read has succeeded, so a refused read
-     * (access denied, a lock conflict) is a clean HTTP error. A body cut off after
-     * the status line makes webdavfs drop the whole mount. */
+    /* The status line goes out only once the first read has succeeded, so a refused read
+     * (access denied, a lock conflict) is a clean HTTP error. A body cut off after the
+     * status line makes webdavfs drop the whole mount. */
     bool ok = true, started = false;
-    uint64_t off = 0;
-    while (ok) {
+    uint64_t off = first;
+    uint64_t left = ranged ? last - first + 1 : UINT64_MAX;   /* chunked: to the end of file */
+    while (ok && left > 0) {
         IrpWaiter *w = irp_waiter_alloc();
         if (!w) { st = WEBDAV_NO_REPLY; ok = false; break; }
-        ReadArgs ra = { ctx, devId, fid, off, WEBDAV_IO_CHUNK, w };
+        uint32_t want = left < WEBDAV_IO_CHUNK ? (uint32_t)left : WEBDAV_IO_CHUNK;
+        ReadArgs ra = { ctx, devId, fid, off, want, w };
         IrpWaiter *r = irp_send_wait(ctx, send_read, &ra, w);
         if (!r) { st = WEBDAV_NO_REPLY; ok = false; break; }
         st = r->ioStatus;
@@ -1002,36 +1036,50 @@ static void handle_get(RDPWebDAVServer *srv, int fd, const HttpRequest *req, boo
         if (st == 0 && r->payload && r->payloadLen >= 4) {
             n = rd32(r->payload);                 /* DR_READ_RSP: Length(4), ReadData */
             if (n > r->payloadLen - 4) n = r->payloadLen - 4;
+            if (n > want) n = want;               /* never more than asked for */
         }
         if (st == NT_END_OF_FILE) st = 0;         /* carries no data */
+        if (st == 0 && n == 0 && ranged && !started) {   /* the file shrank past the range */
+            irp_waiter_unref(r);
+            close_file(ctx, devId, fid);
+            respond_range_not_satisfiable(fd, e.size);
+            return;
+        }
         if (st == 0 && !started) {
             started = true;
-            ok = http_head(fd, 200, "OK", hdrs, -1);
+            ok = ranged ? http_head(fd, 206, "Partial Content", hdrs, (long long)left)
+                        : http_head(fd, 200, "OK", hdrs, -1);
         }
         if (ok && n > 0) {
-            char ch[16];
-            int hl = snprintf(ch, sizeof(ch), "%x\r\n", (unsigned)n);
-            ok = http_send(fd, ch, (size_t)hl) &&
-                 http_send(fd, (const char *)r->payload + 4, n) &&
-                 http_send(fd, "\r\n", 2);
+            if (ranged) {
+                ok = http_send(fd, (const char *)r->payload + 4, n);
+                left -= n;
+            } else {
+                char ch[16];
+                int hl = snprintf(ch, sizeof(ch), "%x\r\n", (unsigned)n);
+                ok = http_send(fd, ch, (size_t)hl) &&
+                     http_send(fd, (const char *)r->payload + 4, n) &&
+                     http_send(fd, "\r\n", 2);
+            }
             off += n;
         }
         irp_waiter_unref(r);
         if (st != 0) { ok = false; break; }
-        if (n < WEBDAV_IO_CHUNK) break;           /* short read: end of file */
+        if (n < want) break;                      /* short read: end of file */
     }
     close_file(ctx, devId, fid);
     if (!started) { respond_failure(fd, req->method, req->path, st); return; }
-    if (ok && http_send(fd, "0\r\n\r\n", 5)) {
+    if (ok && (ranged ? left == 0 : http_send(fd, "0\r\n\r\n", 5))) {
         if (!srv->loggedRead) {
             srv->loggedRead = true;
             rdp_info("webdav: drive \"%s\": first file read OK (%llu bytes)", srv->driveName,
-                     (unsigned long long)off);
+                     (unsigned long long)(off - first));
         }
     } else if (st) {
-        /* No final chunk: the client sees a cut-off body, not a short file. */
+        /* No final chunk, or a body short of its Content-Length: the client sees a cut-off
+         * body, not a short file. */
         rdp_info("webdav: GET %s stopped after %llu bytes: client status 0x%08x",
-                 req->path, (unsigned long long)off, st);
+                 req->path, (unsigned long long)(off - first), st);
     }
 }
 

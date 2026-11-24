@@ -178,6 +178,43 @@ int main(void) {
 #undef AUTH_OK
     }
 
+    {   /* Byte ranges (RFC 9110 14.1.2): result, then the range */
+        static const struct { const char *value; uint64_t size; int want; uint64_t first, last; } R[] = {
+            { "bytes=0-99",        1000,  1, 0, 99 },
+            { "bytes=65536-131071", 300000, 1, 65536, 131071 },
+            { "bytes=0-",          1000,  1, 0, 999 },
+            { "bytes=999-",        1000,  1, 999, 999 },
+            { "bytes=1000-",       1000, -1, 0, 0 },
+            { "bytes=500-2000",    1000,  1, 500, 999 },
+            { "bytes=0-0",         1,     1, 0, 0 },
+            { "bytes=-10",         1000,  1, 990, 999 },
+            { "bytes=-2000",       1000,  1, 0, 999 },
+            { "bytes=-0",          1000, -1, 0, 0 },
+            { "bytes=-5",          0,    -1, 0, 0 },
+            { "bytes=0-",          0,    -1, 0, 0 },
+            { " Bytes=10-20 ",     1000,  1, 10, 20 },
+            { "bytes= 10-20",      1000,  1, 10, 20 },
+            { "bytes=10-20,30-40", 1000,  0, 0, 0 },
+            { "items=0-10",        1000,  0, 0, 0 },
+            { "bytes=20-10",       1000,  0, 0, 0 },
+            { "bytes=a-b",         1000,  0, 0, 0 },
+            { "bytes=-",           1000,  0, 0, 0 },
+            { "bytes=10",          1000,  0, 0, 0 },
+            { "bytes=",            1000,  0, 0, 0 },
+            { "bytes=99999999999999999999999-", 1000, -1, 0, 0 },
+            { "bytes=0-99999999999999999999999", 1000, 1, 0, 999 },
+        };
+        for (size_t i = 0; i < sizeof(R) / sizeof(R[0]); i++) {
+            uint64_t a = 77, b = 77;
+            int got = rdp_http_byte_range(R[i].value, strlen(R[i].value), R[i].size, &a, &b);
+            if (got != R[i].want || (got == 1 && (a != R[i].first || b != R[i].last))) {
+                printf("FAIL range \"%s\" of %llu: %d %llu-%llu\n", R[i].value,
+                       (unsigned long long)R[i].size, got, (unsigned long long)a, (unsigned long long)b);
+                fails++;
+            }
+        }
+    }
+
     printf(fails ? "test_drivepath: %d FAILED\n" : "test_drivepath: all passed\n", fails);
     return fails ? 1 : 0;
 }
